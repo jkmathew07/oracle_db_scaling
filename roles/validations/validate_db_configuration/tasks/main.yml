@@ -34,7 +34,13 @@
 
 - name: "ORA_VAL_DBCFG | parse current parameters into dict"
   ansible.builtin.set_fact:
-    current_params: "{{ dict(_odbcfg_current_raw.stdout_lines | map('regex_replace', '^(.*):(.*)$', '\\1=\\2') | map('trim') | map('split', '=')) }}"
+    current_params: >-
+      {{ dict(_odbcfg_current_raw.stdout_lines
+         | map('trim') | list
+         | reject('equalto', '') | list
+         | select('search', ':') | list
+         | map('regex_replace', '^([^:]+):(.*)$', '\1=\2') | list
+         | map('split', '=', 1) | list) }}
   tags: [validation, execute]
 
 - name: "ORA_VAL_DBCFG | assert this is not a RAC instance"
