@@ -2,7 +2,7 @@
 # --- Oracle environment ---------------------------------------------------
 oracle_user: oracle
 oracle_group: oinstall
-oracle_home: /u01/app/oracle/product/19.0.0/dbhome_1
+oracle_home: "{{ db_home| mandatory }}" 
 oracle_sid: "{{ db_sid | mandatory }}"          # must be passed by Jenkins
 oracle_base: /u01/app/oracle
 
