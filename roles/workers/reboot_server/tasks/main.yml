@@ -31,6 +31,19 @@
   changed_when: false
   tags: [worker, execute]
 
+# If a conflicting sysctl source re-appears here after we neutralized it
+# pre-reboot, something (systemd unit / RPM trigger / cron / udev rule) is
+# regenerating it on every boot - that is the actual owner of the value,
+# not fragmentation or capacity.
+- name: "ORA_WRK_REBOOT | re-scan for conflicting vm.nr_hugepages sysctl sources post-reboot"
+  ansible.builtin.shell: >
+    grep -rlE '^[[:space:]]*vm\.nr_hugepages[[:space:]]*=' 
+    /etc/sysctl.conf /etc/sysctl.d/*.conf /usr/lib/sysctl.d/*.conf /run/sysctl.d/*.conf
+    2>/dev/null || true
+  register: _owrk_reboot_conflicting_files
+  changed_when: false
+  tags: [worker, execute]
+
 - name: "ORA_WRK_REBOOT | assert hugepages allocated correctly post-reboot"
   ansible.builtin.assert:
     that:
@@ -38,12 +51,20 @@
     fail_msg: >-
       HugePages validation failed after reboot: expected {{ required_hugepages_count }},
       got {{ _owrk_hp_post_reboot.stdout }}.
-      Boot cmdline hugepages param present: {{ ('hugepages=' + required_hugepages_count | string) in _owrk_reboot_cmdline.stdout }}.
-      If the boot param IS present but the count is still short, the host does not
-      have enough free physical RAM at boot to satisfy the request (reduce
-      target SGA, free up other memory reservations, or check for firmware/BIOS
-      reserved memory and failed DIMMs) - this is NOT a runtime fragmentation
-      issue since allocation happened at kernel boot.
+      Boot cmdline hugepages param present: {{ _owrk_reboot_cmdline.stdout is regex('(^|\\s)hugepages=' + required_hugepages_count | string + '(\\s|$)') }}.
+      {% if _owrk_reboot_conflicting_files.stdout_lines | length > 0 %}
+      A conflicting sysctl source RE-APPEARED after reboot despite being
+      neutralized pre-reboot: {{ _owrk_reboot_conflicting_files.stdout_lines | join(', ') }}.
+      This means something regenerates it at boot (a systemd unit, RPM
+      trigger/preinstall script, cron job, or udev rule) - find and
+      disable that automation; editing the file alone will not persist.
+      {% else %}
+      No conflicting sysctl source found post-reboot. If the boot param IS
+      present but the count is still short, the host does not have enough
+      free physical RAM at boot to satisfy the request (reduce target SGA,
+      free up other memory reservations, or check for firmware/BIOS
+      reserved memory and failed DIMMs).
+      {% endif %}
     quiet: true
   register: _owrk_hp_post_check
   tags: [worker, execute]
@@ -59,6 +80,6 @@
       ────────────────────────────────────────────────────────────────
       Expected HugePages Count : {{ required_hugepages_count }}
       Actual HugePages Count   : {{ _owrk_hp_post_reboot.stdout }}
-      Boot Param Present       : {{ ('hugepages=' + required_hugepages_count | string) in _owrk_reboot_cmdline.stdout }}
+      Boot Param Present       : {{ _owrk_reboot_cmdline.stdout is regex('(^|\\s)hugepages=' + required_hugepages_count | string + '(\\s|$)') }}
       Validation Status        : {{ 'PASSED' if not _owrk_hp_post_check.failed else 'FAILED' }}
   tags: [worker, display]

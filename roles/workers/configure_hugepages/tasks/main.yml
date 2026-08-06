@@ -25,7 +25,7 @@
 
 - name: "ORA_WRK_HP | determine if boot-time hugepages already match target"
   ansible.builtin.set_fact:
-    _owrk_hp_boot_already_set: "{{ ('hugepages=' + required_hugepages_count | string) in _owrk_hp_cmdline.stdout }}"
+    _owrk_hp_boot_already_set: "{{ _owrk_hp_cmdline.stdout is regex('(^|\\s)hugepages=' + required_hugepages_count | string + '(\\s|$)') }}"
   tags: [worker, execute]
 
 - name: "ORA_WRK_HP | disable Transparent HugePages persistently (RHEL/OL family)"
