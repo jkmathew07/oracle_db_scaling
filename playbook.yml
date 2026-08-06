@@ -3,10 +3,12 @@
 # oracle_database_scaling
 # Entry point. Invoked from Jenkins as:
 #   ansible-playbook playbook.yml -i inventory/hosts.ini \
-#     -e "target_host=dbhost01 scale_option=scale_up sga_max_size_gb=64 \
-#         sga_target_gb=64 pga_aggregate_target_gb=16 pga_aggregate_limit_gb=20 \
-#         processes=1000 sessions=1500 target_server_ram_gb=128" \
+#     -e "target_host=dbhost01 scale_option=scale_up db_sid=ORCL db_home=/u01/app/oracle/product/19.0.0/dbhome_1 \
+#         sga_max_size_gb=64 sga_target_gb=64 pga_aggregate_target_gb=16 \
+#         pga_aggregate_limit_gb=20 processes=1000 target_server_ram_gb=128" \
 #     --vault-password-file=.vaultpass
+# NOTE: sessions is NOT passed - it's derived from processes (see
+# roles/validations/validate_input) using Oracle's documented formula.
 # ============================================================================
 - name: Oracle Database Scaling Orchestrator
   hosts: "{{ target_host | default('all') }}"

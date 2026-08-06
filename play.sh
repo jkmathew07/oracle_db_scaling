@@ -1,5 +1,6 @@
  ansible-playbook playbook.yml -i inventory/hosts.yml \
-   -e "target_host=genx-db-711.genex.com scale_option=scale_up \
+      -e "target_host=genx-db-711.genex.com 
+        scale_option=scale_up \
         db_sid=PRODCDB \
         db_home=/u01/app/oracle/product/19.3.0/dbhome_1 \
         sga_max_size_gb=4 \

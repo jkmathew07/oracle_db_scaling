@@ -5,17 +5,7 @@
 # ambiguous ranges in the original requirement (flaw fix).
 # ============================================================================
 
-# --- Required per-run inputs (Jenkins MUST supply these) --------------------
-# scale_option: scale_up | scale_down
-# sga_max_size_gb, sga_target_gb
-# pga_aggregate_target_gb, pga_aggregate_limit_gb
-# processes, sessions
-# target_server_ram_gb   <- the RAM the host will have AFTER the resize
-#                           (for scale_up: new bigger RAM already applied by
-#                            infra/hypervisor BEFORE this playbook runs;
-#                            for scale_down: the smaller RAM that infra will
-#                            apply AFTER this playbook finishes the DB shrink
-#                            and reboots the host - see README ordering note)
+
 
 scale_option: "{{ scale_option | mandatory }}"
 
@@ -27,7 +17,7 @@ min_free_mem_percent_for_pga: 40 # scale_down only: free (non-hugepage) RAM must
 # --- HugePages guardrails -----------------------------------------------------
 hugepage_size_mb: 2            # `Hugepagesize` from /proc/meminfo, in MB (2 or 1024)
 hugepage_buffer_percent: 5     # target hugepages = SGA_MAX_SIZE * (1 + buffer%)
-hugepage_buffer_min_percent: 2 # acceptable band lower bound 
+hugepage_buffer_min_percent: 2 # acceptable band lower bound (flaw fix: was contradictory)
 hugepage_overallocation_threshold_percent: 10  # scale_down: reconfig hugepages if
                                                 # currently allocated exceeds the
                                                 # NEW target by more than this %

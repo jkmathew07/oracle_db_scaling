@@ -1,19 +1,43 @@
 ---
-- name: "ORA_VAL_INPUT | assert mandatory parameters present"
+- name: "ORA_VAL_INPUT | reset missing-parameter tracker"
+  ansible.builtin.set_fact:
+    _oval_missing_vars: []
+  tags: [validation, execute]
+
+- name: "ORA_VAL_INPUT | identify any missing mandatory parameters by name"
+  ansible.builtin.set_fact:
+    _oval_missing_vars: "{{ _oval_missing_vars + [item] }}"
+  loop:
+    - scale_option
+    - db_sid
+    - oracle_home
+    - sga_max_size_gb
+    - sga_target_gb
+    - pga_aggregate_target_gb
+    - pga_aggregate_limit_gb
+    - processes
+    - target_server_ram_gb
+  when: vars[item] is not defined
+  tags: [validation, execute]
+
+- name: "ORA_VAL_INPUT | assert no mandatory parameters are missing"
+  ansible.builtin.assert:
+    that:
+      - _oval_missing_vars | length == 0
+    fail_msg: >-
+      Missing required input parameter(s): {{ _oval_missing_vars | join(', ') }}.
+      Check the Jenkins job / -e invocation includes all of these by name.
+    quiet: true
+  register: _oval_input_presence
+  tags: [validation, execute]
+
+- name: "ORA_VAL_INPUT | assert scale_option has a valid value"
   ansible.builtin.assert:
     that:
       - scale_option in ['scale_up', 'scale_down']
-      - sga_max_size_gb is defined
-      - sga_target_gb is defined
-      - pga_aggregate_target_gb is defined
-      - pga_aggregate_limit_gb is defined
-      - processes is defined
-      - sessions is defined
-      - target_server_ram_gb is defined
-      - db_sid is defined
-    fail_msg: "Missing/invalid required input parameters for {{ scale_option }}"
+    fail_msg: "scale_option must be 'scale_up' or 'scale_down', got: {{ scale_option | default('undefined') }}"
     quiet: true
-  register: _oval_input_presence
+  register: _oval_input_scale_option
   tags: [validation, execute]
 
 - name: "ORA_VAL_INPUT | assert numeric sanity of inputs"
@@ -23,9 +47,19 @@
       - pga_aggregate_target_gb | int > 0
       - pga_aggregate_limit_gb | int >= (pga_aggregate_target_gb | int)
       - target_server_ram_gb | int > 0
+      - processes | int > 0
     fail_msg: "Invalid numeric parameter configuration"
     quiet: true
   register: _oval_input_numeric
+  tags: [validation, execute]
+
+# sessions is deliberately NOT an accepted input - it is always derived from
+# processes using Oracle's documented formula, so Jenkins/the caller only
+# ever needs to supply processes. Rounded UP (ceil) since sessions is a hard
+# ceiling and Oracle's own guidance rounds up, not down.
+- name: "ORA_VAL_INPUT | derive sessions from processes (Oracle formula: 1.5 * processes + 22)"
+  ansible.builtin.set_fact:
+    sessions: "{{ ((1.5 * (processes | int)) + 22) | round(0, 'ceil') | int }}"
   tags: [validation, execute]
 
 - name: "ORA_VAL_INPUT | display input validation summary"
@@ -36,14 +70,16 @@
       ╚═══════════════════════════════════════════════════════════════╝
       Scale Option          : {{ scale_option }}
       DB SID                : {{ db_sid }}
+      ORACLE_HOME            : {{ oracle_home }}
       SGA_MAX_SIZE (GB)     : {{ sga_max_size_gb }}
       SGA_TARGET (GB)       : {{ sga_target_gb }}
       PGA_AGGR_TARGET (GB)  : {{ pga_aggregate_target_gb }}
       PGA_AGGR_LIMIT (GB)   : {{ pga_aggregate_limit_gb }}
       PROCESSES             : {{ processes }}
-      SESSIONS              : {{ sessions }}
+      SESSIONS (derived)    : {{ sessions }}  (= 1.5 x {{ processes }} + 22, rounded up)
       Target Server RAM(GB) : {{ target_server_ram_gb }}
       ────────────────────────────────────────────────────────────────
       Mandatory fields check : {{ 'PASSED' if not _oval_input_presence.failed else 'FAILED' }}
+      Scale option check     : {{ 'PASSED' if not _oval_input_scale_option.failed else 'FAILED' }}
       Numeric sanity check   : {{ 'PASSED' if not _oval_input_numeric.failed else 'FAILED' }}
   tags: [validation, display]
