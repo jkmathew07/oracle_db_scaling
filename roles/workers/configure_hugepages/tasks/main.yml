@@ -28,11 +28,32 @@
     _owrk_hp_boot_already_set: "{{ _owrk_hp_cmdline.stdout is regex('(^|\\s)hugepages=' + required_hugepages_count | string + '(\\s|$)') }}"
   tags: [worker, execute]
 
-- name: "ORA_WRK_HP | disable Transparent HugePages persistently (RHEL/OL family)"
+- name: "ORA_WRK_HP | strip any stale hugepages-related kernel boot args before reapplying"
+  ansible.builtin.command: >
+    grubby --update-kernel=ALL
+    --remove-args="default_hugepagesz hugepagesz hugepages transparent_hugepage oracle_hugepages.nr"
+  register: _owrk_hp_grubby_strip
+  failed_when: false
+  when:
+    - _owrk_hp_use_grubby
+    - not _owrk_hp_boot_already_set
+  tags: [worker, execute]
+
+# oracle_hugepages.nr is a kernel boot parameter read by a dracut (initramfs)
+# module shipped with oracle-database-preinstall-19c. It runs during early
+# boot, BEFORE systemd starts, so masking any systemd service cannot stop
+# it. With nr=0 (the RPM default) it auto-calculates its own hugepages count
+# and overwrites both the sysctl file and the effective `hugepages=` kernel
+# arg on every boot - which is what kept forcing the count back to its own
+# value regardless of what we set. Pinning oracle_hugepages.nr to OUR count
+# redirects their own module to use our number instead of auto-calculating,
+# which is the supported way to override this behavior.
+- name: "ORA_WRK_HP | disable Transparent HugePages and pin oracle_hugepages.nr (RHEL/OL family)"
   ansible.builtin.command: >
     grubby --update-kernel=ALL
     --args="default_hugepagesz={{ hugepage_size_mb }}M hugepagesz={{ hugepage_size_mb }}M
-    hugepages={{ required_hugepages_count }} transparent_hugepage=never"
+    hugepages={{ required_hugepages_count }} transparent_hugepage=never
+    oracle_hugepages.nr={{ required_hugepages_count }}"
   register: _owrk_hp_grubby
   when:
     - _owrk_hp_use_grubby
@@ -41,11 +62,17 @@
 
 - name: "ORA_WRK_HP | disable Transparent HugePages persistently (Debian family)"
   block:
+    - name: "ORA_WRK_HP | strip stale hugepages boot params from /etc/default/grub"
+      ansible.builtin.replace:
+        path: /etc/default/grub
+        regexp: '\s*(default_hugepagesz|hugepagesz|hugepages|transparent_hugepage|oracle_hugepages\.nr)=\S+'
+        replace: ''
+
     - name: "ORA_WRK_HP | update /etc/default/grub with hugepages boot params"
       ansible.builtin.replace:
         path: /etc/default/grub
         regexp: '^(GRUB_CMDLINE_LINUX=")([^"]*)(")'
-        replace: '\1\2 default_hugepagesz={{ hugepage_size_mb }}M hugepagesz={{ hugepage_size_mb }}M hugepages={{ required_hugepages_count }} transparent_hugepage=never\3'
+        replace: '\1\2 default_hugepagesz={{ hugepage_size_mb }}M hugepagesz={{ hugepage_size_mb }}M hugepages={{ required_hugepages_count }} transparent_hugepage=never oracle_hugepages.nr={{ required_hugepages_count }}\3'
       register: _owrk_hp_grubcfg
 
     - name: "ORA_WRK_HP | regenerate grub config"
