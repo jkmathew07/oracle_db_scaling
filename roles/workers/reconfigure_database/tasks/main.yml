@@ -106,39 +106,92 @@
       {% endif %}
   tags: [worker, display]
 
-# RMAN backup spfile (not a plain file copy) - this works correctly
-# regardless of whether the spfile lives on filesystem or in ASM, and is
-# the standard, supported way to back up and later restore a binary spfile.
-- name: "ORA_WRK_RECONFIG | create spfile backup via RMAN"
+# Plain OS-level copy of the actual spfile - no RMAN anywhere in this
+# playbook, per explicit requirement. This only works for a filesystem-
+# located spfile; if it lives in ASM (path starts with '+'), a plain file
+# copy cannot read it - fail loudly rather than silently skip the backup,
+# since "backup before update" is mandatory here.
+- name: "ORA_WRK_RECONFIG | locate the actual spfile path"
   become: true
   become_user: "{{ oracle_user }}"
   environment:
     ORACLE_HOME: "{{ oracle_home }}"
     ORACLE_SID: "{{ oracle_sid }}"
   ansible.builtin.shell: |
-    {{ oracle_home }}/bin/rman target / <<EOF
-    backup spfile format '{{ pfile_backup_dir }}/spfile{{ oracle_sid }}_{{ pfile_backup_ts }}.bkp';
+    {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    set heading off feedback off pagesize 0 verify off
+    select value from v\$parameter where name='spfile';
     exit;
     EOF
-  register: _owrk_reconfig_spfile
-  failed_when: "'RMAN-' in _owrk_reconfig_spfile.stdout or 'ORA-' in _owrk_reconfig_spfile.stdout"
+  register: _owrk_reconfig_spfile_path_raw
+  changed_when: false
+  tags: [worker, execute]
+
+- name: "ORA_WRK_RECONFIG | normalize spfile path"
+  ansible.builtin.set_fact:
+    _owrk_reconfig_spfile_path: "{{ _owrk_reconfig_spfile_path_raw.stdout | default('') | trim }}"
+  tags: [worker, execute]
+
+- name: "ORA_WRK_RECONFIG | refuse to proceed if spfile is in ASM (plain copy cannot read it)"
+  ansible.builtin.assert:
+    that:
+      - not (_owrk_reconfig_spfile_path | trim | first == '+')
+    fail_msg: >-
+      SPFILE for {{ oracle_sid }} is located in ASM ({{ _owrk_reconfig_spfile_path }}).
+      A plain OS file copy cannot read an ASM-managed file, and this
+      playbook does not use RMAN or asmcmd. Cannot safely back up the
+      spfile - refusing to proceed with any configuration change.
+    quiet: true
+  when: _owrk_reconfig_spfile_path | length > 0
+  tags: [worker, execute]
+
+- name: "ORA_WRK_RECONFIG | ensure spfile backup destination directory exists"
+  become: true
+  become_user: "{{ oracle_user }}"
+  ansible.builtin.file:
+    path: "{{ oracle_base }}/admin/pfiles"
+    state: directory
+    mode: '0750'
+  tags: [worker, execute]
+
+- name: "ORA_WRK_RECONFIG | copy spfile to backup location"
+  become: true
+  become_user: "{{ oracle_user }}"
+  ansible.builtin.copy:
+    remote_src: true
+    src: "{{ _owrk_reconfig_spfile_path }}"
+    dest: "{{ oracle_base }}/admin/pfiles/spfile_{{ oracle_sid }}.ora_{{ pfile_backup_ts }}"
+    mode: '0640'
+  register: _owrk_reconfig_spfile_copy
+  tags: [worker, execute]
+
+- name: "ORA_WRK_RECONFIG | verify spfile backup copy exists on disk"
+  ansible.builtin.stat:
+    path: "{{ oracle_base }}/admin/pfiles/spfile_{{ oracle_sid }}.ora_{{ pfile_backup_ts }}"
+  register: _owrk_reconfig_spfile_check
+  tags: [worker, execute]
+
+- name: "ORA_WRK_RECONFIG | assert spfile backup copy actually exists"
+  ansible.builtin.assert:
+    that:
+      - _owrk_reconfig_spfile_check.stat.exists
+    fail_msg: >-
+      Expected spfile backup copy was not found at
+      {{ oracle_base }}/admin/pfiles/spfile_{{ oracle_sid }}.ora_{{ pfile_backup_ts }}
+      after the copy task reported success - refusing to proceed.
+    quiet: true
   tags: [worker, execute]
 
 - name: "ORA_WRK_RECONFIG | display spfile backup output"
   ansible.builtin.debug:
     msg: |
       ╔═══════════════════════════════════════════════════════════════╗
-      ║  Oracle Scaling — SPFILE Backup Result (RMAN)                  ║
+      ║  Oracle Scaling — SPFILE Backup Result (plain file copy)       ║
       ╚═══════════════════════════════════════════════════════════════╝
-      Return code : {{ _owrk_reconfig_spfile.rc }}
-      Backup Piece: {{ pfile_backup_dir }}/spfile{{ oracle_sid }}_{{ pfile_backup_ts }}.bkp
-      Restore with: RMAN> restore spfile from '{{ pfile_backup_dir }}/spfile{{ oracle_sid }}_{{ pfile_backup_ts }}.bkp';
-      ────────────────────────────────────────────────────────────────
-      {{ _owrk_reconfig_spfile.stdout | default('(no output)') | truncate(2000) }}
-      {% if _owrk_reconfig_spfile.stderr | default('') | length > 0 %}
-      STDERR:
-      {{ _owrk_reconfig_spfile.stderr | truncate(500) }}
-      {% endif %}
+      Source SPFILE : {{ _owrk_reconfig_spfile_path }}
+      Backup Copy   : {{ oracle_base }}/admin/pfiles/spfile_{{ oracle_sid }}.ora_{{ pfile_backup_ts }}
+      Copy Applied  : {{ _owrk_reconfig_spfile_copy.changed }}
+      Verified      : {{ _owrk_reconfig_spfile_check.stat.exists }}
   tags: [worker, display]
 
 - name: "ORA_WRK_RECONFIG | apply new parameters to spfile"

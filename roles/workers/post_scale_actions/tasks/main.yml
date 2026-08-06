@@ -1,7 +1,8 @@
 ---
 # "Post Scale Actions" from the workflow diagram - runs after
 # startup_database (target_mode: open). Verifies both backups from this
-# run exist, and writes a summary record. Does not itself start/stop/open
+# run exist, queries and displays the parameters that were actually
+# changed, and writes a summary record. Does not itself start/stop/open
 # anything.
 
 - name: "ORA_WRK_POST | verify pfile backup was created this run"
@@ -13,7 +14,7 @@
 
 - name: "ORA_WRK_POST | verify spfile backup was created this run"
   ansible.builtin.stat:
-    path: "{{ pfile_backup_dir }}/spfile{{ oracle_sid }}_{{ pfile_backup_ts | default('') }}.bkp"
+    path: "{{ oracle_base }}/admin/pfiles/spfile_{{ oracle_sid }}.ora_{{ pfile_backup_ts | default('') }}"
   register: _owrk_post_spfile_check
   when: pfile_backup_ts is defined
   tags: [worker, execute]
@@ -24,11 +25,44 @@
       - _owrk_post_pfile_check.stat.exists
       - _owrk_post_spfile_check.stat.exists
     fail_msg: >-
-      Expected pfile and/or spfile backup for this run was not found under
-      {{ pfile_backup_dir }} (timestamp {{ pfile_backup_ts }}). The
-      reconfigure step may not have completed as expected.
+      Expected pfile and/or spfile backup for this run was not found
+      (pfile under {{ pfile_backup_dir }}, spfile under
+      {{ oracle_base }}/admin/pfiles - timestamp {{ pfile_backup_ts }}).
+      The reconfigure step may not have completed as expected.
     quiet: true
   when: pfile_backup_ts is defined
+  tags: [worker, execute]
+
+# Query the live, post-scaling values of exactly the parameters this run
+# targeted, from the now-open/mounted instance - proof of what actually
+# took effect, not just what was requested.
+- name: "ORA_WRK_POST | query current live parameter values after scaling"
+  become: true
+  become_user: "{{ oracle_user }}"
+  environment:
+    ORACLE_HOME: "{{ oracle_home }}"
+    ORACLE_SID: "{{ oracle_sid }}"
+  ansible.builtin.shell: |
+    {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    set heading off feedback off pagesize 0 verify off
+    select upper(name) || ':' || value from v\$parameter
+    where name in ('sga_max_size','sga_target',
+    'pga_aggregate_target','pga_aggregate_limit','processes','sessions');
+    exit;
+    EOF
+  register: _owrk_post_params_raw
+  changed_when: false
+  tags: [worker, execute]
+
+- name: "ORA_WRK_POST | parse current live parameter values"
+  ansible.builtin.set_fact:
+    _owrk_post_params: >-
+      {{ dict(_owrk_post_params_raw.stdout_lines
+         | map('trim') | list
+         | reject('equalto', '') | list
+         | select('search', ':') | list
+         | map('regex_replace', '^([^:]+):(.*)$', '\1=\2') | list
+         | map('split', '=', 1) | list) }}
   tags: [worker, execute]
 
 - name: "ORA_WRK_POST | ensure log directory exists"
@@ -49,19 +83,64 @@
         "scale_option": "{{ scale_option }}",
         "completed_at": "{{ ansible_date_time.iso8601 }}",
         "final_instance_state": "{{ final_instance_state | default('unknown') }}",
-        "sga_max_size_gb": {{ sga_max_size_gb }},
-        "sga_target_gb": {{ sga_target_gb }},
-        "pga_aggregate_target_gb": {{ pga_aggregate_target_gb }},
-        "pga_aggregate_limit_gb": {{ pga_aggregate_limit_gb }},
-        "processes": {{ processes }},
-        "sessions": {{ sessions }},
+        "requested": {
+          "sga_max_size_gb": {{ sga_max_size_gb }},
+          "sga_target_gb": {{ sga_target_gb }},
+          "pga_aggregate_target_gb": {{ pga_aggregate_target_gb }},
+          "pga_aggregate_limit_gb": {{ pga_aggregate_limit_gb }},
+          "processes": {{ processes }},
+          "sessions": {{ sessions }}
+        },
+        "current_live_bytes_or_count": {
+          "sga_max_size": "{{ _owrk_post_params['SGA_MAX_SIZE'] | default('n/a') }}",
+          "sga_target": "{{ _owrk_post_params['SGA_TARGET'] | default('n/a') }}",
+          "pga_aggregate_target": "{{ _owrk_post_params['PGA_AGGREGATE_TARGET'] | default('n/a') }}",
+          "pga_aggregate_limit": "{{ _owrk_post_params['PGA_AGGREGATE_LIMIT'] | default('n/a') }}",
+          "processes": "{{ _owrk_post_params['PROCESSES'] | default('n/a') }}",
+          "sessions": "{{ _owrk_post_params['SESSIONS'] | default('n/a') }}"
+        },
         "hugepages_reconfigured": {{ (hugepages_reconfigured | default(false)) | lower }},
         "pfile_backup": "{{ pfile_backup_ts | default('n/a') }}",
-        "spfile_backup": "{{ ('spfile' + oracle_sid + '_' + pfile_backup_ts + '.bkp') if pfile_backup_ts is defined else 'n/a' }}",
+        "spfile_backup": "{{ ('spfile_' + oracle_sid + '.ora_' + pfile_backup_ts) if pfile_backup_ts is defined else 'n/a' }}",
         "db_config_was_already_optimal": {{ (db_config_already_optimal | default(false)) | lower }}
       }
   register: _owrk_post_record
   tags: [worker, execute]
+
+- name: "ORA_WRK_POST | convert live parameter values to GB for display"
+  ansible.builtin.set_fact:
+    _owrk_post_sga_max_size_live_gb: "{{ ((_owrk_post_params['SGA_MAX_SIZE'] | default(0) | int) / 1073741824) | round(2) }}"
+    _owrk_post_sga_target_live_gb: "{{ ((_owrk_post_params['SGA_TARGET'] | default(0) | int) / 1073741824) | round(2) }}"
+    _owrk_post_pga_target_live_gb: "{{ ((_owrk_post_params['PGA_AGGREGATE_TARGET'] | default(0) | int) / 1073741824) | round(2) }}"
+    _owrk_post_pga_limit_live_gb: "{{ ((_owrk_post_params['PGA_AGGREGATE_LIMIT'] | default(0) | int) / 1073741824) | round(2) }}"
+  tags: [worker, execute]
+
+- name: "ORA_WRK_POST | display changed parameters (requested vs current live value)"
+  ansible.builtin.debug:
+    msg: |
+      ╔═══════════════════════════════════════════════════════════════╗
+      ║  Oracle Scaling — Parameters After Scaling                     ║
+      ╚═══════════════════════════════════════════════════════════════╝
+      SID   : {{ oracle_sid }}      Instance State : {{ final_instance_state | default('unknown') }}
+      ────────────────────────────────────────────────────────────────
+      Parameter              Requested (GB/#)     Current Live (GB/#)
+      ────────────────────────────────────────────────────────────────
+      SGA_MAX_SIZE         : {{ sga_max_size_gb }}   ->  {{ _owrk_post_sga_max_size_live_gb }}
+      SGA_TARGET           : {{ sga_target_gb }}   ->  {{ _owrk_post_sga_target_live_gb }}
+      PGA_AGGREGATE_TARGET : {{ pga_aggregate_target_gb }}   ->  {{ _owrk_post_pga_target_live_gb }}
+      PGA_AGGREGATE_LIMIT  : {{ pga_aggregate_limit_gb }}   ->  {{ _owrk_post_pga_limit_live_gb }}
+      PROCESSES            : {{ processes }}   ->  {{ _owrk_post_params['PROCESSES'] | default('n/a') }}
+      SESSIONS             : {{ sessions }}   ->  {{ _owrk_post_params['SESSIONS'] | default('n/a') }}
+      ────────────────────────────────────────────────────────────────
+      Match Status          : {{ 'ALL MATCH - scaling applied correctly' if
+        (_owrk_post_sga_max_size_live_gb | float == sga_max_size_gb | float) and
+        (_owrk_post_sga_target_live_gb | float == sga_target_gb | float) and
+        (_owrk_post_pga_target_live_gb | float == pga_aggregate_target_gb | float) and
+        (_owrk_post_pga_limit_live_gb | float == pga_aggregate_limit_gb | float) and
+        (_owrk_post_params['PROCESSES'] | default(-1) | int == processes | int) and
+        (_owrk_post_params['SESSIONS'] | default(-1) | int == sessions | int)
+        else 'MISMATCH DETECTED - review values above' }}
+  tags: [worker, display]
 
 - name: "ORA_WRK_POST | display post-scale summary"
   ansible.builtin.debug:
