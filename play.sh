@@ -3,8 +3,10 @@
         db_sid=PRODCDB \
         db_home=/u01/app/oracle/product/19.3.0/dbhome_1 \
         sga_max_size_gb=4 \
-        sga_target_gb=6 pga_aggregate_target_gb=2 pga_aggregate_limit_gb=4 \
-        processes=1000 sessions=1522 target_server_ram_gb=16" 
+        sga_target_gb=6 
+        pga_aggregate_target_gb=2 \
+        pga_aggregate_limit_gb=4 \
+        processes=1000 target_server_ram_gb=16" 
 #     --vault-password-file=.vaultpass
 
 #formula for sessions = SESSIONS = (1.5 * PROCESSES) + 22
