@@ -136,7 +136,7 @@
 # meant to avoid. Only the specific hugepages line is neutralized; the
 # rest of rc.local (e.g. touch /var/lock/subsys/local) is left untouched.
 - name: "ORA_WRK_HP | detect legacy rc.local hugepages override"
-  ansible.builtin.shell: "grep -n 'nr_hugepages' /etc/rc.d/rc.local 2>/dev/null || true"
+  ansible.builtin.shell: "grep -nE '^\\s*sysctl\\s+-w\\s+vm\\.nr_hugepages=' /etc/rc.d/rc.local 2>/dev/null || true"
   register: _owrk_hp_rclocal_scan
   changed_when: false
   failed_when: false
