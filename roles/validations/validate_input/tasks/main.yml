@@ -44,11 +44,20 @@
   ansible.builtin.assert:
     that:
       - sga_max_size_gb | int > 0
+      - sga_target_gb | int > 0
+      - sga_target_gb | int <= sga_max_size_gb | int
       - pga_aggregate_target_gb | int > 0
       - pga_aggregate_limit_gb | int >= (pga_aggregate_target_gb | int)
       - target_server_ram_gb | int > 0
       - processes | int > 0
-    fail_msg: "Invalid numeric parameter configuration"
+    fail_msg: >-
+      Invalid numeric parameter configuration. Common cause: sga_target_gb
+      ({{ sga_target_gb | default('?') }}) must be <= sga_max_size_gb
+      ({{ sga_max_size_gb | default('?') }}) - Oracle does not enforce this
+      at 'alter system set ... scope=spfile' time, only at instance startup,
+      so an invalid combination here will silently corrupt the spfile and
+      the instance will refuse to start (ORA-00823/ORA-01078) until it is
+      manually corrected from a pfile backup.
     quiet: true
   register: _oval_input_numeric
   tags: [validation, execute]

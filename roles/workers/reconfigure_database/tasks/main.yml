@@ -1,10 +1,13 @@
 ---
-# JIT (just-in-time) check: startup_database_mount already ran earlier in
-# the orchestrator sequence, but that was a separate role/task some steps
-# ago - trusting it blindly here would mean a pfile backup or spfile change
-# could be attempted against an instance that went down in between (crash,
-# a reboot race, an external HA/monitoring agent, etc). Verify - and
-# self-heal to MOUNT if needed - immediately before touching anything.
+# JIT (just-in-time) verification: startup_database_mount already ran
+# earlier in the orchestrator sequence and owns bringing the instance up -
+# this role does NOT re-implement startup logic. It only confirms, right
+# before touching anything, that the instance is still in the state that
+# role left it in. If it isn't, that is surfaced as a distinct failure
+# rather than silently retried, because "instance down" and "instance
+# won't start because the spfile itself is invalid" (e.g. ORA-00823
+# sga_target > sga_max_size) are different problems - retrying startup
+# cannot fix the second one, and blindly doing so here would mask it.
 - name: "ORA_WRK_RECONFIG | check instance status immediately before any configuration change"
   become: true
   become_user: "{{ oracle_user }}"
@@ -27,51 +30,20 @@
     _owrk_reconfig_status_ok: "{{ ('MOUNTED' in (_owrk_reconfig_precheck.stdout | default('') | upper)) or ('OPEN' in (_owrk_reconfig_precheck.stdout | default('') | upper)) }}"
   tags: [worker, execute]
 
-- name: "ORA_WRK_RECONFIG | self-heal - bring instance to MOUNT if it is not up"
-  become: true
-  become_user: "{{ oracle_user }}"
-  environment:
-    ORACLE_HOME: "{{ oracle_home }}"
-    ORACLE_SID: "{{ oracle_sid }}"
-  ansible.builtin.shell: |
-    {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
-    startup mount;
-    exit;
-    EOF
-  register: _owrk_reconfig_selfheal
-  when: not _owrk_reconfig_status_ok
-  failed_when: "'ORA-' in _owrk_reconfig_selfheal.stdout"
-  tags: [worker, execute]
-
-- name: "ORA_WRK_RECONFIG | re-check instance status after self-heal attempt"
-  become: true
-  become_user: "{{ oracle_user }}"
-  environment:
-    ORACLE_HOME: "{{ oracle_home }}"
-    ORACLE_SID: "{{ oracle_sid }}"
-  ansible.builtin.shell: |
-    {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
-    set heading off feedback off pagesize 0
-    select status from v\$instance;
-    exit;
-    EOF
-  register: _owrk_reconfig_postcheck
-  changed_when: false
-  when: not _owrk_reconfig_status_ok
-  tags: [worker, execute]
-
-- name: "ORA_WRK_RECONFIG | refuse to proceed if instance is still not confirmed up"
+- name: "ORA_WRK_RECONFIG | refuse to proceed if instance is not confirmed up"
   ansible.builtin.assert:
     that:
-      - _owrk_reconfig_status_ok or
-        ('MOUNTED' in (_owrk_reconfig_postcheck.stdout | default('') | upper)) or
-        ('OPEN' in (_owrk_reconfig_postcheck.stdout | default('') | upper))
+      - _owrk_reconfig_status_ok
     fail_msg: >-
-      Instance {{ oracle_sid }} is not reachable (status: '{{
-      (_owrk_reconfig_postcheck.stdout | default(_owrk_reconfig_precheck.stdout)) | default('no output') | trim
-      }}') even after a self-heal startup mount attempt. Refusing to take a
-      pfile backup or change spfile parameters against an instance that is
-      not confirmed up - investigate manually before re-running.
+      Instance {{ oracle_sid }} is not in MOUNT/OPEN state (status check
+      returned: '{{ _owrk_reconfig_precheck.stdout | default('no output') | trim }}').
+      Refusing to take a pfile backup or change spfile parameters against an
+      instance that is not confirmed up. This role does not attempt to start
+      it - that is startup_database_mount's job, earlier in this run. If
+      that role reported success but the instance is down again now,
+      investigate why it went down in between (crash, an external HA/
+      monitoring agent, a spfile that is already invalid and refuses to
+      start - check the alert log) rather than re-running blindly.
     quiet: true
   tags: [worker, execute]
 
@@ -82,13 +54,10 @@
       ║  Oracle Scaling — Pre-Change Instance Status Check              ║
       ╚═══════════════════════════════════════════════════════════════╝
       SID                    : {{ oracle_sid }}
-      Status (initial check) : {{ _owrk_reconfig_precheck.stdout | default('(no output)') | trim }}
-      Self-heal attempted    : {{ not _owrk_reconfig_status_ok }}
-      {% if not _owrk_reconfig_status_ok %}
-      Status (after self-heal): {{ _owrk_reconfig_postcheck.stdout | default('(no output)') | trim }}
-      {% endif %}
+      Status                 : {{ _owrk_reconfig_precheck.stdout | default('(no output)') | trim }}
       Proceeding with changes : YES - instance confirmed up
   tags: [worker, display]
+
 
 - name: "ORA_WRK_RECONFIG | ensure pfile backup directory exists"
   become: true
