@@ -1,0 +1,140 @@
+---
+# ============================================================================
+# Pre-flight full-state check. Runs BEFORE the scale_up/scale_down block,
+# right after validate_memory. Entirely read-only - it never starts,
+# stops, or reconfigures anything. Its only job is to answer: "has this
+# exact request already been applied?" If yes (hugepages already correct
+# AND the database is already OPEN with matching parameters), the entire
+# scale_up/scale_down block is skipped - no shutdown, no reboot, no
+# reconfigure - because none of that is needed and all of it is
+# disruptive. This is what makes re-running the same job twice safe and
+# cheap instead of a repeated maintenance window.
+#
+# The DB-optimal claim is only ever made when the instance is CURRENTLY
+# OPEN and its live parameters already match - if it's down or only
+# mounted, we genuinely don't know without starting it, so this never
+# guesses; it falls through to the normal (safe) workflow in that case.
+# ============================================================================
+
+- name: "ORA_VAL_STATE | check OS-level pmon process for this instance"
+  ansible.builtin.shell: "ps -ef | grep -i 'ora_pmon_{{ oracle_sid }}' | grep -v grep || true"
+  register: _ovalstate_pmon_check
+  changed_when: false
+  failed_when: false
+  tags: [validation, execute]
+
+- name: "ORA_VAL_STATE | determine if instance process is running"
+  ansible.builtin.set_fact:
+    _ovalstate_pmon_running: "{{ (_ovalstate_pmon_check.stdout | default('')) | trim | length > 0 }}"
+  tags: [validation, execute]
+
+- name: "ORA_VAL_STATE | check current instance status (read-only)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  environment:
+    ORACLE_HOME: "{{ oracle_home }}"
+    ORACLE_SID: "{{ oracle_sid }}"
+  ansible.builtin.shell: |
+    {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    set heading off feedback off pagesize 0 verify off
+    select status from v\$instance;
+    exit;
+    EOF
+  register: _ovalstate_status_raw
+  when: _ovalstate_pmon_running
+  changed_when: false
+  failed_when: false
+  tags: [validation, execute]
+
+- name: "ORA_VAL_STATE | normalize instance status"
+  ansible.builtin.set_fact:
+    _ovalstate_status: >-
+      {{ (_ovalstate_status_raw.stdout | default('')) | trim | upper if _ovalstate_pmon_running else '' }}
+  tags: [validation, execute]
+
+# Only query live parameters when the instance is confirmed OPEN - that's
+# the only state where "already matches" is a claim we can trust without
+# starting anything ourselves.
+- name: "ORA_VAL_STATE | query live parameters if instance is already OPEN"
+  become: true
+  become_user: "{{ oracle_user }}"
+  environment:
+    ORACLE_HOME: "{{ oracle_home }}"
+    ORACLE_SID: "{{ oracle_sid }}"
+  ansible.builtin.shell: |
+    {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    set heading off feedback off pagesize 0 verify off
+    select upper(name) || ':' || value from v\$parameter
+    where name in ('sga_max_size','sga_target',
+    'pga_aggregate_target','pga_aggregate_limit','processes','sessions');
+    exit;
+    EOF
+  register: _ovalstate_params_raw
+  when: "'OPEN' in _ovalstate_status"
+  changed_when: false
+  tags: [validation, execute]
+
+- name: "ORA_VAL_STATE | parse live parameters if queried"
+  ansible.builtin.set_fact:
+    _ovalstate_params: >-
+      {{ dict(_ovalstate_params_raw.stdout_lines
+         | map('trim') | list
+         | reject('equalto', '') | list
+         | select('search', ':') | list
+         | map('regex_replace', '^([^:]+):(.*)$', '\1=\2') | list
+         | map('split', '=', 1) | list) }}
+  when: "'OPEN' in _ovalstate_status"
+  tags: [validation, execute]
+
+- name: "ORA_VAL_STATE | determine if live DB parameters already match target"
+  ansible.builtin.set_fact:
+    _ovalstate_db_already_optimal: >-
+      {{ ('OPEN' in _ovalstate_status) and
+         (_ovalstate_params['SGA_MAX_SIZE'] | default(-1) | int == sga_max_size_gb | int * 1073741824) and
+         (_ovalstate_params['SGA_TARGET'] | default(-1) | int == sga_target_gb | int * 1073741824) and
+         (_ovalstate_params['PGA_AGGREGATE_TARGET'] | default(-1) | int == pga_aggregate_target_gb | int * 1073741824) and
+         (_ovalstate_params['PGA_AGGREGATE_LIMIT'] | default(-1) | int == pga_aggregate_limit_gb | int * 1073741824) and
+         (_ovalstate_params['PROCESSES'] | default(-1) | int == processes | int) and
+         (_ovalstate_params['SESSIONS'] | default(-1) | int == sessions | int) }}
+  tags: [validation, execute]
+
+# Reuse the existing hardened hugepages check role directly rather than
+# duplicating its math - it is already read-only (only reads /proc/meminfo
+# and /proc/cmdline, sets facts, never modifies anything).
+- ansible.builtin.include_role:
+    name: validations/validate_hugepages
+  tags: [validation, execute]
+
+- name: "ORA_VAL_STATE | decide whether the scale operation can be skipped entirely"
+  ansible.builtin.set_fact:
+    scale_operation_needed: >-
+      {{ not (optimal_huge_pages_configured and _ovalstate_db_already_optimal) }}
+  tags: [validation, execute]
+
+- name: "ORA_VAL_STATE | display pre-flight decision"
+  ansible.builtin.debug:
+    msg: |
+      ╔═══════════════════════════════════════════════════════════════╗
+      ║  Oracle Scaling — Pre-Flight Idempotency Check                 ║
+      ╚═══════════════════════════════════════════════════════════════╝
+      SID                       : {{ oracle_sid }}
+      PMON Detected             : {{ _ovalstate_pmon_running }}
+      Current Instance Status   : {{ _ovalstate_status if _ovalstate_status | length > 0 else 'DOWN' }}
+      ────────────────────────────────────────────────────────────────
+      HugePages Already Correct : {{ optimal_huge_pages_configured }}
+      DB Params Already Match   : {{ _ovalstate_db_already_optimal }}
+      {% if 'OPEN' not in _ovalstate_status %}
+      (DB params check skipped - instance is not OPEN, cannot safely
+      claim "already matches" without starting it. Proceeding normally.)
+      {% endif %}
+      ══════════════════════════════════════════════════════════════════
+      {% if not scale_operation_needed %}
+      ✔ NO ACTION NEEDED — the database is already in the requested
+        configuration (hugepages and parameters both match). Skipping
+        the entire scale_{{ scale_option.split('_')[1] }} workflow -
+        no shutdown, no reboot, no reconfiguration will be performed.
+      {% else %}
+      ⚙ PROCEEDING — one or more items are not yet at the target state.
+        Continuing with the normal scale_{{ scale_option.split('_')[1] }} workflow.
+      {% endif %}
+  tags: [validation, display]

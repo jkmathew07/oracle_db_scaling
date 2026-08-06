@@ -31,6 +31,14 @@
     - ansible.builtin.include_role:
         name: validations/validate_memory
 
+    # Read-only pre-flight: decides whether this exact request has already
+    # been applied (hugepages correct + DB already OPEN with matching
+    # params). Sets scale_operation_needed - both blocks below are gated
+    # on it, so a repeat run with identical parameters is a safe, cheap
+    # no-op instead of a second unnecessary maintenance window.
+    - ansible.builtin.include_role:
+        name: validations/validate_current_state
+
     # ================================================================
     # SCALE UP - matches Scale-Up Workflow diagram exactly:
     # Validate Inputs -> Validate Memory -> Check HugePages ->
@@ -44,7 +52,7 @@
     # startup_database is a single consolidated role (target_mode: mount
     # or open) - see roles/workers/startup_database.
     # ================================================================
-    - when: scale_option == 'scale_up'
+    - when: scale_option == 'scale_up' and scale_operation_needed
       block:
         - ansible.builtin.include_role:
             name: validations/validate_hugepages
@@ -93,7 +101,7 @@
     # database is even touched - opposite position from scale_up, matches
     # the corrected diagram.
     # ================================================================
-    - when: scale_option == 'scale_down'
+    - when: scale_option == 'scale_down' and scale_operation_needed
       block:
         - ansible.builtin.include_role:
             name: validations/validate_hugepages

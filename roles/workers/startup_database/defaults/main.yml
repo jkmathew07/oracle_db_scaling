@@ -1,0 +1,5 @@
+---
+# Default is MOUNT - callers pass target_mode: open only where the diagram
+# actually needs the database opened. This mirrors Oracle's own startup
+# semantics (STARTUP with no OPEN clause stops at MOUNT).
+target_mode: mount
