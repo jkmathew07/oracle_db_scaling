@@ -64,6 +64,30 @@
   register: _owrk_hp_sysctl_removed
   tags: [worker, execute]
 
+# oracle-database-preinstall-19c ships a "firstboot" service that, despite
+# the name, re-runs on every boot on some builds and rewrites
+# /etc/sysctl.d/99-oracle-hugepages.conf with its OWN auto-calculated value
+# (oracle_hugepages.nr=0 heuristic), unconditionally overriding whatever we
+# set - via GRUB or via sysctl file. Masking it is the actual fix; editing
+# the file content alone does not persist since the service just rewrites
+# it again on the next boot.
+- name: "ORA_WRK_HP | detect oracle preinstall firstboot hugepages service"
+  ansible.builtin.shell: "systemctl list-unit-files --no-legend 'oracle-database-preinstall*firstboot*' | awk '{print $1}'"
+  register: _owrk_hp_preinstall_svc
+  changed_when: false
+  failed_when: false
+  tags: [worker, execute]
+
+- name: "ORA_WRK_HP | mask oracle preinstall firstboot service"
+  ansible.builtin.systemd:
+    name: "{{ _owrk_hp_preinstall_svc.stdout }}"
+    masked: true
+    enabled: false
+    state: stopped
+  register: _owrk_hp_preinstall_masked
+  when: _owrk_hp_preinstall_svc.stdout | trim | length > 0
+  tags: [worker, execute]
+
 # systemd-sysctl.service applies ALL sysctl.conf/sysctl.d sources AFTER the
 # kernel's own boot-time GRUB hugepages reservation. If any OTHER file
 # (commonly written by Oracle's RDBMS preinstall RPM, or a manual admin
@@ -115,6 +139,9 @@
       Already Set At Boot       : {{ _owrk_hp_boot_already_set }}
       GRUB Config Updated       : {{ hugepages_reconfigured }}
       Transparent HugePages     : DISABLED (transparent_hugepage=never)
+      ────────────────────────────────────────────────────────────────
+      Preinstall firstboot svc  : {{ _owrk_hp_preinstall_svc.stdout | trim if _owrk_hp_preinstall_svc.stdout | trim | length > 0 else 'not found' }}
+      Firstboot Service Masked  : {{ _owrk_hp_preinstall_svc.stdout | trim | length > 0 }}
       ────────────────────────────────────────────────────────────────
       Conflicting sysctl files  : {{ _owrk_hp_conflicting_files.stdout_lines | join(', ') if _owrk_hp_conflicting_files.stdout_lines | length > 0 else 'none found' }}
       Conflicts Neutralized     : {{ _owrk_hp_conflicting_files.stdout_lines | length > 0 }}
