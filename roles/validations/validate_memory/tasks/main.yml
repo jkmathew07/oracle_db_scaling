@@ -1,4 +1,29 @@
 ---
+# Guards against the case where target_server_ram_gb was passed by Jenkins
+# but the host was never actually resized to that value (VM/hypervisor
+# resize is external to this play - see README). Catching this here fails
+# fast, before any hugepages reconfig or reboot is attempted.
+- name: "ORA_VAL_MEM | read live server RAM"
+  ansible.builtin.set_fact:
+    actual_server_ram_gb: "{{ (ansible_facts['memtotal_mb'] | float / 1024) | round(2) }}"
+  tags: [validation, execute]
+
+- name: "ORA_VAL_MEM | assert host has actually been resized to target_server_ram_gb"
+  ansible.builtin.assert:
+    that:
+      # allow 5% tolerance for kernel/firmware/hypervisor-reserved memory
+      - actual_server_ram_gb | float >= (target_server_ram_gb | float * 0.95)
+    fail_msg: >-
+      Server RAM mismatch: actual live RAM is {{ actual_server_ram_gb }} GB but
+      target_server_ram_gb={{ target_server_ram_gb }} GB was requested. The host
+      has not been resized yet (scale_up requires server resize BEFORE this play
+      runs; scale_down requires the resize AFTER this play's reboot). Confirm the
+      VM/hypervisor resize completed, or correct target_server_ram_gb, before
+      re-running.
+    quiet: true
+  register: _oval_mem_ramcheck
+  tags: [validation, execute]
+
 - name: "ORA_VAL_MEM | compute memory budget"
   ansible.builtin.set_fact:
     max_oracle_mem_gb: "{{ (target_server_ram_gb | float * (max_oracle_mem_percent | float / 100)) | round(2) }}"
@@ -43,7 +68,10 @@
       ╔═══════════════════════════════════════════════════════════════╗
       ║  Oracle Scaling — Memory Validation Summary                    ║
       ╚═══════════════════════════════════════════════════════════════╝
+      Actual Live RAM (GB)       : {{ actual_server_ram_gb }}
       Target Server RAM (GB)     : {{ target_server_ram_gb }}
+      Server Resize Check        : {{ 'PASSED' if not _oval_mem_ramcheck.failed else 'FAILED' }}
+      ────────────────────────────────────────────────────────────────
       Max Oracle Mem Allowed(GB) : {{ max_oracle_mem_gb }} ({{ max_oracle_mem_percent }}% cap)
       Requested SGA+PGA (GB)     : {{ requested_oracle_mem_gb }}
       Memory Budget Check        : {{ 'PASSED' if not _oval_mem_budget.failed else 'FAILED' }}
