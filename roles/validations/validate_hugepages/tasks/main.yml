@@ -1,68 +1,247 @@
 ---
-- name: "ORA_VAL_HP | read current HugePages_Total from /proc/meminfo"
-  ansible.builtin.shell: "grep -i '^HugePages_Total' /proc/meminfo | awk '{print $2}'"
-  register: _ohp_total_raw
+# ============================================================================
+# DESIGN PRINCIPLE: detect, then act - never blind.
+# Every remediation below (legacy rc.local override, stale sysctl files,
+# the Oracle preinstall firstboot service) first runs a read-only detection
+# task and is scoped to run ONLY `when` that detection finds the specific
+# condition on THIS host. Servers that don't have a given legacy artifact
+# are left completely untouched by that step - nothing here assumes any
+# server's history; every fix is conditional on verified evidence gathered
+# from that same server, in the same run.
+# ============================================================================
+#
+# NOTE: HugePages are reserved via the GRUB kernel command line, not runtime
+# sysctl. Runtime `sysctl vm.nr_hugepages` allocation is fragmentation-
+# sensitive - by the time it applies post-boot, other services have already
+# scattered physical memory and the kernel can only satisfy a PARTIAL
+# request (this is the root cause of "expected N, got fewer" failures).
+# Boot-time reservation via GRUB guarantees the full contiguous allocation
+# because it happens before any userspace process runs.
+
+- name: "ORA_WRK_HP | compute required hugepage count"
+  ansible.builtin.set_fact:
+    required_hugepages_count: "{{ ((target_hugepages_gb_max | float) * 1024 / hugepage_size_mb) | round(0, 'ceil') | int }}"
+  tags: [worker, execute]
+
+- name: "ORA_WRK_HP | detect bootloader tooling"
+  ansible.builtin.set_fact:
+    _owrk_hp_use_grubby: "{{ ansible_facts['os_family'] in ['RedHat'] }}"
+  tags: [worker, execute]
+
+- name: "ORA_WRK_HP | read current kernel boot parameters"
+  ansible.builtin.command: cat /proc/cmdline
+  register: _owrk_hp_cmdline
   changed_when: false
-  tags: [validation, execute]
+  tags: [worker, execute]
 
-- name: "ORA_VAL_HP | compute current hugepages allocation in GB"
+- name: "ORA_WRK_HP | determine if boot-time hugepages already match target"
   ansible.builtin.set_fact:
-    current_hugepages_total: "{{ _ohp_total_raw.stdout | int }}"
-    current_hugepages_gb: "{{ ((_ohp_total_raw.stdout | int) * hugepage_size_mb / 1024) | round(2) }}"
-  tags: [validation, execute]
+    _owrk_hp_boot_already_set: "{{ _owrk_hp_cmdline.stdout is regex('(^|\\s)hugepages=' + required_hugepages_count | string + '(\\s|$)') }}"
+  tags: [worker, execute]
 
-- name: "ORA_VAL_HP | compute target hugepages band for requested SGA"
-  ansible.builtin.set_fact:
-    target_hugepages_gb_max: "{{ (sga_max_size_gb | float * (1 + hugepage_buffer_percent | float / 100)) | round(2) }}"
-    target_hugepages_gb_min: "{{ (sga_max_size_gb | float * (1 + hugepage_buffer_min_percent | float / 100)) | round(2) }}"
-  tags: [validation, execute]
+- name: "ORA_WRK_HP | strip any stale hugepages-related kernel boot args before reapplying"
+  ansible.builtin.command: >
+    grubby --update-kernel=ALL
+    --remove-args="default_hugepagesz hugepagesz hugepages transparent_hugepage oracle_hugepages.nr"
+  register: _owrk_hp_grubby_strip
+  failed_when: false
+  when:
+    - _owrk_hp_use_grubby
+    - not _owrk_hp_boot_already_set
+  tags: [worker, execute]
 
-- name: "ORA_VAL_HP | scale_up — determine if reconfiguration is required"
-  ansible.builtin.set_fact:
-    optimal_huge_pages_configured: >-
-      {{ (current_hugepages_gb | float >= target_hugepages_gb_min | float) and
-         (current_hugepages_gb | float <= target_hugepages_gb_max | float) }}
-  when: scale_option == 'scale_up'
-  tags: [validation, execute]
+# oracle_hugepages.nr was investigated as a possible dracut-level override
+# but confirmed NOT present on this host (empty on /proc/cmdline and
+# grubby --info=ALL) - the actual root cause is the rc.local script below.
+- name: "ORA_WRK_HP | disable Transparent HugePages (RHEL/OL family)"
+  ansible.builtin.command: >
+    grubby --update-kernel=ALL
+    --args="default_hugepagesz={{ hugepage_size_mb }}M hugepagesz={{ hugepage_size_mb }}M
+    hugepages={{ required_hugepages_count }} transparent_hugepage=never"
+  register: _owrk_hp_grubby
+  when:
+    - _owrk_hp_use_grubby
+    - not _owrk_hp_boot_already_set
+  tags: [worker, execute]
 
-- name: "ORA_VAL_HP | scale_down — compute over-allocation vs new SGA target"
-  ansible.builtin.set_fact:
-    overallocation_percent: >-
-      {{ (((current_hugepages_gb | float - target_hugepages_gb_max | float) /
-          target_hugepages_gb_max | float) * 100) | round(2) }}
-  when: scale_option == 'scale_down'
-  tags: [validation, execute]
+- name: "ORA_WRK_HP | disable Transparent HugePages persistently (Debian family)"
+  block:
+    - name: "ORA_WRK_HP | strip stale hugepages boot params from /etc/default/grub"
+      ansible.builtin.replace:
+        path: /etc/default/grub
+        regexp: '\s*(default_hugepagesz|hugepagesz|hugepages|transparent_hugepage)=\S+'
+        replace: ''
 
-- name: "ORA_VAL_HP | scale_down — determine if reconfiguration is required"
-  ansible.builtin.set_fact:
-    optimal_huge_pages_configured: "{{ overallocation_percent | float <= hugepage_overallocation_threshold_percent | float }}"
-  when: scale_option == 'scale_down'
-  tags: [validation, execute]
+    - name: "ORA_WRK_HP | update /etc/default/grub with hugepages boot params"
+      ansible.builtin.replace:
+        path: /etc/default/grub
+        regexp: '^(GRUB_CMDLINE_LINUX=")([^"]*)(")'
+        replace: '\1\2 default_hugepagesz={{ hugepage_size_mb }}M hugepagesz={{ hugepage_size_mb }}M hugepages={{ required_hugepages_count }} transparent_hugepage=never\3'
+      register: _owrk_hp_grubcfg
 
-- name: "ORA_VAL_HP | assert current hugepages can back requested SGA"
+    - name: "ORA_WRK_HP | regenerate grub config"
+      ansible.builtin.command: update-grub
+      when: _owrk_hp_grubcfg.changed
+      register: _owrk_hp_grubby
+  when:
+    - not _owrk_hp_use_grubby
+    - not _owrk_hp_boot_already_set
+  tags: [worker, execute]
+
+- name: "ORA_WRK_HP | detect stale runtime sysctl override from prior playbook versions"
+  ansible.builtin.stat:
+    path: /etc/sysctl.d/98-oracle-hugepages.conf
+  register: _owrk_hp_stale_sysctl_stat
+  tags: [worker, execute]
+
+- name: "ORA_WRK_HP | remove stale runtime sysctl override (only if it exists)"
+  ansible.builtin.file:
+    path: /etc/sysctl.d/98-oracle-hugepages.conf
+    state: absent
+  register: _owrk_hp_sysctl_removed
+  when: _owrk_hp_stale_sysctl_stat.stat.exists
+  tags: [worker, execute]
+
+# oracle-database-preinstall-19c ships a "firstboot" service that, despite
+# the name, re-runs on every boot on some builds and rewrites
+# /etc/sysctl.d/99-oracle-hugepages.conf with its OWN auto-calculated value
+# (oracle_hugepages.nr=0 heuristic), unconditionally overriding whatever we
+# set - via GRUB or via sysctl file. Masking it is the actual fix; editing
+# the file content alone does not persist since the service just rewrites
+# it again on the next boot.
+- name: "ORA_WRK_HP | detect oracle preinstall firstboot hugepages service"
+  ansible.builtin.shell: "systemctl list-unit-files --no-legend 'oracle-database-preinstall*firstboot*' | awk '{print $1}'"
+  register: _owrk_hp_preinstall_svc
+  changed_when: false
+  failed_when: false
+  tags: [worker, execute]
+
+- name: "ORA_WRK_HP | mask oracle preinstall firstboot service"
+  ansible.builtin.systemd:
+    name: "{{ _owrk_hp_preinstall_svc.stdout }}"
+    masked: true
+    enabled: false
+    state: stopped
+  register: _owrk_hp_preinstall_masked
+  when: _owrk_hp_preinstall_svc.stdout | trim | length > 0
+  tags: [worker, execute]
+
+# CONFIRMED ROOT CAUSE (via journalctl -b0 on genx-db-711): rc-local.service
+# runs /etc/rc.d/rc.local on every boot, AFTER the kernel's GRUB-based
+# boot-time hugepages reservation has already completed. This host has a
+# hardcoded `sysctl -w vm.nr_hugepages=N` line in rc.local (predates this
+# playbook) that runtime-resizes the pool right after boot, silently
+# overwriting whatever GRUB correctly reserved - reintroducing the exact
+# fragmentation-sensitive runtime-sysctl problem GRUB reservation was
+# meant to avoid. Only the specific hugepages line is neutralized; the
+# rest of rc.local (e.g. touch /var/lock/subsys/local) is left untouched.
+- name: "ORA_WRK_HP | detect legacy rc.local hugepages override"
+  ansible.builtin.shell: "grep -n 'nr_hugepages' /etc/rc.d/rc.local 2>/dev/null || true"
+  register: _owrk_hp_rclocal_scan
+  changed_when: false
+  failed_when: false
+  tags: [worker, execute]
+
+- name: "ORA_WRK_HP | neutralize legacy rc.local hugepages override"
+  ansible.builtin.replace:
+    path: /etc/rc.d/rc.local
+    regexp: '^(\s*)sysctl\s+-w\s+vm\.nr_hugepages=.*$'
+    replace: '\1# vm.nr_hugepages override removed by oracle_db_scaling - hugepages now managed via GRUB boot parameter (see /proc/cmdline)'
+  register: _owrk_hp_rclocal_neutralized
+  when: _owrk_hp_rclocal_scan.stdout | length > 0
+  tags: [worker, execute]
+
+- name: "ORA_WRK_HP | verify rc.local override was actually neutralized"
   ansible.builtin.assert:
     that:
-      - current_hugepages_gb | float >= sga_max_size_gb | float
+      - _owrk_hp_rclocal_neutralized.changed
     fail_msg: >-
-      Invalid configuration: current hugepages ({{ current_hugepages_gb }} GB) cannot
-      back requested SGA_MAX_SIZE ({{ sga_max_size_gb }} GB + buffer)
+      Detected a legacy hugepages override in rc.local but the replace did
+      NOT modify the file (regexp did not match) - the override is still
+      active. Check the exact line format in /etc/rc.d/rc.local manually.
     quiet: true
-  register: _oval_hp_feasibility
-  when: scale_option == 'scale_down'
-  tags: [validation, execute]
+  when: _owrk_hp_rclocal_scan.stdout | length > 0
+  tags: [worker, execute]
 
-- name: "ORA_VAL_HP | display hugepages validation summary"
+# systemd-sysctl.service applies ALL sysctl.conf/sysctl.d sources AFTER the
+# kernel's own boot-time GRUB hugepages reservation. If any OTHER file
+# (commonly written by Oracle's RDBMS preinstall RPM, or a manual admin
+# change) still sets vm.nr_hugepages, it silently overrides our GRUB value
+# on every boot - this is why the actual count can get stuck at an old
+# number regardless of what the GRUB parameter requests.
+- name: "ORA_WRK_HP | scan all sysctl sources for conflicting vm.nr_hugepages entries"
+  ansible.builtin.shell: >
+    grep -rlE '^[[:space:]]*vm\.nr_hugepages[[:space:]]*=' 
+    /etc/sysctl.conf /etc/sysctl.d/*.conf /usr/lib/sysctl.d/*.conf /run/sysctl.d/*.conf
+    2>/dev/null || true
+  register: _owrk_hp_conflicting_files
+  changed_when: false
+  tags: [worker, execute]
+
+- name: "ORA_WRK_HP | neutralize conflicting vm.nr_hugepages entries in other sysctl sources"
+  ansible.builtin.replace:
+    path: "{{ item }}"
+    regexp: '^(\s*)vm\.nr_hugepages(\s*=.*)$'
+    replace: '\1# vm.nr_hugepages managed by oracle_db_scaling via GRUB boot parameter - see /proc/cmdline (was:\2)'
+  loop: "{{ _owrk_hp_conflicting_files.stdout_lines }}"
+  when: _owrk_hp_conflicting_files.stdout_lines | length > 0
+  register: _owrk_hp_conflicts_neutralized
+  tags: [worker, execute]
+
+- name: "ORA_WRK_HP | verify each conflicting sysctl source was actually neutralized"
+  ansible.builtin.assert:
+    that:
+      - item.changed
+    fail_msg: >-
+      Detected vm.nr_hugepages in {{ item.item }} but the replace did NOT
+      modify the file (regexp did not match) - the conflicting entry is
+      still active. Check the exact line format in that file manually.
+    quiet: true
+  loop: "{{ _owrk_hp_conflicts_neutralized.results | default([]) }}"
+  when: _owrk_hp_conflicting_files.stdout_lines | length > 0
+  tags: [worker, execute]
+
+- name: "ORA_WRK_HP | set memlock ulimit for oracle user"
+  community.general.pam_limits:
+    domain: "{{ oracle_user }}"
+    limit_type: "-"
+    limit_item: memlock
+    value: "{{ (required_hugepages_count | int * hugepage_size_mb) }}"
+  register: _owrk_hp_memlock
+  tags: [worker, execute]
+
+- name: "ORA_WRK_HP | record pending hugepage change for post-reboot validation"
+  ansible.builtin.set_fact:
+    hugepages_reconfigured: "{{ not _owrk_hp_boot_already_set }}"
+  tags: [worker, execute]
+
+- name: "ORA_WRK_HP | display hugepages configuration summary"
   ansible.builtin.debug:
     msg: |
       ╔═══════════════════════════════════════════════════════════════╗
-      ║  Oracle Scaling — HugePages Validation Summary                 ║
+      ║  Oracle Scaling — HugePages Configuration Applied               ║
       ╚═══════════════════════════════════════════════════════════════╝
-      Current HugePages Total    : {{ current_hugepages_total }} ({{ current_hugepages_gb }} GB)
-      Target Band (GB)           : {{ target_hugepages_gb_min }} — {{ target_hugepages_gb_max }}
+      Required HugePages Count  : {{ required_hugepages_count }} (x {{ hugepage_size_mb }} MB)
+      Allocation Method         : GRUB kernel boot parameter (deterministic,
+                                   not runtime sysctl - avoids fragmentation)
+      Already Set At Boot       : {{ _owrk_hp_boot_already_set }}
+      GRUB Config Updated       : {{ hugepages_reconfigured }}
+      Transparent HugePages     : DISABLED (transparent_hugepage=never)
       ────────────────────────────────────────────────────────────────
-      {% if scale_option == 'scale_down' %}
-      Over-allocation vs new SGA : {{ overallocation_percent }}% (threshold {{ hugepage_overallocation_threshold_percent }}%)
-      Feasibility Check          : {{ 'PASSED' if not _oval_hp_feasibility.failed else 'FAILED' }}
-      {% endif %}
-      Reconfiguration Required   : {{ 'NO — already optimal' if optimal_huge_pages_configured else 'YES' }}
-  tags: [validation, display]
+      Legacy 98-*.conf detected : {{ _owrk_hp_stale_sysctl_stat.stat.exists }}
+      Legacy 98-*.conf removed  : {{ _owrk_hp_sysctl_removed.changed | default(false) }}
+      ────────────────────────────────────────────────────────────────
+      Preinstall firstboot svc  : {{ _owrk_hp_preinstall_svc.stdout | trim if _owrk_hp_preinstall_svc.stdout | trim | length > 0 else 'not found - untouched' }}
+      Firstboot Service Masked  : {{ _owrk_hp_preinstall_svc.stdout | trim | length > 0 }}
+      ────────────────────────────────────────────────────────────────
+      Legacy rc.local override  : {{ 'FOUND — ' + _owrk_hp_rclocal_scan.stdout if _owrk_hp_rclocal_scan.stdout | length > 0 else 'not found - untouched' }}
+      rc.local Neutralized      : {{ _owrk_hp_rclocal_neutralized.changed | default(false) }}
+      ────────────────────────────────────────────────────────────────
+      Conflicting sysctl files  : {{ _owrk_hp_conflicting_files.stdout_lines | join(', ') if _owrk_hp_conflicting_files.stdout_lines | length > 0 else 'not found - untouched' }}
+      Conflicts Neutralized     : {{ (_owrk_hp_conflicts_neutralized.results | default([]) | map(attribute='changed') | list) if _owrk_hp_conflicting_files.stdout_lines | length > 0 else 'n/a' }}
+      ────────────────────────────────────────────────────────────────
+      Memlock Limit (KB)        : {{ (required_hugepages_count | int * hugepage_size_mb) }}
+      Memlock Change Applied    : {{ _owrk_hp_memlock.changed }}
+      ────────────────────────────────────────────────────────────────
+      NOTE: Reboot required for the kernel to reserve hugepages at boot.
+  tags: [worker, display]
