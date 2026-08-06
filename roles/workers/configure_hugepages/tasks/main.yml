@@ -1,4 +1,15 @@
 ---
+# ============================================================================
+# DESIGN PRINCIPLE: detect, then act - never blind.
+# Every remediation below (legacy rc.local override, stale sysctl files,
+# the Oracle preinstall firstboot service) first runs a read-only detection
+# task and is scoped to run ONLY `when` that detection finds the specific
+# condition on THIS host. Servers that don't have a given legacy artifact
+# are left completely untouched by that step - nothing here assumes any
+# server's history; every fix is conditional on verified evidence gathered
+# from that same server, in the same run.
+# ============================================================================
+#
 # NOTE: HugePages are reserved via the GRUB kernel command line, not runtime
 # sysctl. Runtime `sysctl vm.nr_hugepages` allocation is fragmentation-
 # sensitive - by the time it applies post-boot, other services have already
@@ -39,21 +50,14 @@
     - not _owrk_hp_boot_already_set
   tags: [worker, execute]
 
-# oracle_hugepages.nr is a kernel boot parameter read by a dracut (initramfs)
-# module shipped with oracle-database-preinstall-19c. It runs during early
-# boot, BEFORE systemd starts, so masking any systemd service cannot stop
-# it. With nr=0 (the RPM default) it auto-calculates its own hugepages count
-# and overwrites both the sysctl file and the effective `hugepages=` kernel
-# arg on every boot - which is what kept forcing the count back to its own
-# value regardless of what we set. Pinning oracle_hugepages.nr to OUR count
-# redirects their own module to use our number instead of auto-calculating,
-# which is the supported way to override this behavior.
-- name: "ORA_WRK_HP | disable Transparent HugePages and pin oracle_hugepages.nr (RHEL/OL family)"
+# oracle_hugepages.nr was investigated as a possible dracut-level override
+# but confirmed NOT present on this host (empty on /proc/cmdline and
+# grubby --info=ALL) - the actual root cause is the rc.local script below.
+- name: "ORA_WRK_HP | disable Transparent HugePages (RHEL/OL family)"
   ansible.builtin.command: >
     grubby --update-kernel=ALL
     --args="default_hugepagesz={{ hugepage_size_mb }}M hugepagesz={{ hugepage_size_mb }}M
-    hugepages={{ required_hugepages_count }} transparent_hugepage=never
-    oracle_hugepages.nr={{ required_hugepages_count }}"
+    hugepages={{ required_hugepages_count }} transparent_hugepage=never"
   register: _owrk_hp_grubby
   when:
     - _owrk_hp_use_grubby
@@ -65,14 +69,14 @@
     - name: "ORA_WRK_HP | strip stale hugepages boot params from /etc/default/grub"
       ansible.builtin.replace:
         path: /etc/default/grub
-        regexp: '\s*(default_hugepagesz|hugepagesz|hugepages|transparent_hugepage|oracle_hugepages\.nr)=\S+'
+        regexp: '\s*(default_hugepagesz|hugepagesz|hugepages|transparent_hugepage)=\S+'
         replace: ''
 
     - name: "ORA_WRK_HP | update /etc/default/grub with hugepages boot params"
       ansible.builtin.replace:
         path: /etc/default/grub
         regexp: '^(GRUB_CMDLINE_LINUX=")([^"]*)(")'
-        replace: '\1\2 default_hugepagesz={{ hugepage_size_mb }}M hugepagesz={{ hugepage_size_mb }}M hugepages={{ required_hugepages_count }} transparent_hugepage=never oracle_hugepages.nr={{ required_hugepages_count }}\3'
+        replace: '\1\2 default_hugepagesz={{ hugepage_size_mb }}M hugepagesz={{ hugepage_size_mb }}M hugepages={{ required_hugepages_count }} transparent_hugepage=never\3'
       register: _owrk_hp_grubcfg
 
     - name: "ORA_WRK_HP | regenerate grub config"
@@ -84,11 +88,18 @@
     - not _owrk_hp_boot_already_set
   tags: [worker, execute]
 
-- name: "ORA_WRK_HP | remove stale runtime sysctl override (if present from prior versions)"
+- name: "ORA_WRK_HP | detect stale runtime sysctl override from prior playbook versions"
+  ansible.builtin.stat:
+    path: /etc/sysctl.d/98-oracle-hugepages.conf
+  register: _owrk_hp_stale_sysctl_stat
+  tags: [worker, execute]
+
+- name: "ORA_WRK_HP | remove stale runtime sysctl override (only if it exists)"
   ansible.builtin.file:
     path: /etc/sysctl.d/98-oracle-hugepages.conf
     state: absent
   register: _owrk_hp_sysctl_removed
+  when: _owrk_hp_stale_sysctl_stat.stat.exists
   tags: [worker, execute]
 
 # oracle-database-preinstall-19c ships a "firstboot" service that, despite
@@ -113,6 +124,31 @@
     state: stopped
   register: _owrk_hp_preinstall_masked
   when: _owrk_hp_preinstall_svc.stdout | trim | length > 0
+  tags: [worker, execute]
+
+# CONFIRMED ROOT CAUSE (via journalctl -b0 on genx-db-711): rc-local.service
+# runs /etc/rc.d/rc.local on every boot, AFTER the kernel's GRUB-based
+# boot-time hugepages reservation has already completed. This host has a
+# hardcoded `sysctl -w vm.nr_hugepages=N` line in rc.local (predates this
+# playbook) that runtime-resizes the pool right after boot, silently
+# overwriting whatever GRUB correctly reserved - reintroducing the exact
+# fragmentation-sensitive runtime-sysctl problem GRUB reservation was
+# meant to avoid. Only the specific hugepages line is neutralized; the
+# rest of rc.local (e.g. touch /var/lock/subsys/local) is left untouched.
+- name: "ORA_WRK_HP | detect legacy rc.local hugepages override"
+  ansible.builtin.shell: "grep -n 'nr_hugepages' /etc/rc.d/rc.local 2>/dev/null || true"
+  register: _owrk_hp_rclocal_scan
+  changed_when: false
+  failed_when: false
+  tags: [worker, execute]
+
+- name: "ORA_WRK_HP | neutralize legacy rc.local hugepages override"
+  ansible.builtin.replace:
+    path: /etc/rc.d/rc.local
+    regexp: '^([[:space:]]*)sysctl[[:space:]]+-w[[:space:]]+vm\.nr_hugepages=.*$'
+    replace: '\1# vm.nr_hugepages override removed by oracle_db_scaling - hugepages now managed via GRUB boot parameter (see /proc/cmdline)'
+  register: _owrk_hp_rclocal_neutralized
+  when: _owrk_hp_rclocal_scan.stdout | length > 0
   tags: [worker, execute]
 
 # systemd-sysctl.service applies ALL sysctl.conf/sysctl.d sources AFTER the
@@ -167,10 +203,16 @@
       GRUB Config Updated       : {{ hugepages_reconfigured }}
       Transparent HugePages     : DISABLED (transparent_hugepage=never)
       ────────────────────────────────────────────────────────────────
-      Preinstall firstboot svc  : {{ _owrk_hp_preinstall_svc.stdout | trim if _owrk_hp_preinstall_svc.stdout | trim | length > 0 else 'not found' }}
+      Legacy 98-*.conf detected : {{ _owrk_hp_stale_sysctl_stat.stat.exists }}
+      Legacy 98-*.conf removed  : {{ _owrk_hp_sysctl_removed.changed | default(false) }}
+      ────────────────────────────────────────────────────────────────
+      Preinstall firstboot svc  : {{ _owrk_hp_preinstall_svc.stdout | trim if _owrk_hp_preinstall_svc.stdout | trim | length > 0 else 'not found - untouched' }}
       Firstboot Service Masked  : {{ _owrk_hp_preinstall_svc.stdout | trim | length > 0 }}
       ────────────────────────────────────────────────────────────────
-      Conflicting sysctl files  : {{ _owrk_hp_conflicting_files.stdout_lines | join(', ') if _owrk_hp_conflicting_files.stdout_lines | length > 0 else 'none found' }}
+      Legacy rc.local override  : {{ 'FOUND — ' + _owrk_hp_rclocal_scan.stdout if _owrk_hp_rclocal_scan.stdout | length > 0 else 'not found - untouched' }}
+      rc.local Neutralized      : {{ _owrk_hp_rclocal_scan.stdout | length > 0 }}
+      ────────────────────────────────────────────────────────────────
+      Conflicting sysctl files  : {{ _owrk_hp_conflicting_files.stdout_lines | join(', ') if _owrk_hp_conflicting_files.stdout_lines | length > 0 else 'not found - untouched' }}
       Conflicts Neutralized     : {{ _owrk_hp_conflicting_files.stdout_lines | length > 0 }}
       ────────────────────────────────────────────────────────────────
       Memlock Limit (KB)        : {{ (required_hugepages_count | int * hugepage_size_mb) }}
