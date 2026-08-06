@@ -1,17 +1,67 @@
 ---
+# NOTE: HugePages are reserved via the GRUB kernel command line, not runtime
+# sysctl. Runtime `sysctl vm.nr_hugepages` allocation is fragmentation-
+# sensitive - by the time it applies post-boot, other services have already
+# scattered physical memory and the kernel can only satisfy a PARTIAL
+# request (this is the root cause of "expected N, got fewer" failures).
+# Boot-time reservation via GRUB guarantees the full contiguous allocation
+# because it happens before any userspace process runs.
+
 - name: "ORA_WRK_HP | compute required hugepage count"
   ansible.builtin.set_fact:
     required_hugepages_count: "{{ ((target_hugepages_gb_max | float) * 1024 / hugepage_size_mb) | round(0, 'ceil') | int }}"
   tags: [worker, execute]
 
-- name: "ORA_WRK_HP | persist vm.nr_hugepages via sysctl"
-  ansible.posix.sysctl:
-    name: vm.nr_hugepages
-    value: "{{ required_hugepages_count }}"
-    sysctl_file: /etc/sysctl.d/98-oracle-hugepages.conf
-    state: present
-    reload: false
-  register: _owrk_hp_sysctl
+- name: "ORA_WRK_HP | detect bootloader tooling"
+  ansible.builtin.set_fact:
+    _owrk_hp_use_grubby: "{{ ansible_facts['os_family'] in ['RedHat'] }}"
+  tags: [worker, execute]
+
+- name: "ORA_WRK_HP | read current kernel boot parameters"
+  ansible.builtin.command: cat /proc/cmdline
+  register: _owrk_hp_cmdline
+  changed_when: false
+  tags: [worker, execute]
+
+- name: "ORA_WRK_HP | determine if boot-time hugepages already match target"
+  ansible.builtin.set_fact:
+    _owrk_hp_boot_already_set: "{{ ('hugepages=' + required_hugepages_count | string) in _owrk_hp_cmdline.stdout }}"
+  tags: [worker, execute]
+
+- name: "ORA_WRK_HP | disable Transparent HugePages persistently (RHEL/OL family)"
+  ansible.builtin.command: >
+    grubby --update-kernel=ALL
+    --args="default_hugepagesz={{ hugepage_size_mb }}M hugepagesz={{ hugepage_size_mb }}M
+    hugepages={{ required_hugepages_count }} transparent_hugepage=never"
+  register: _owrk_hp_grubby
+  when:
+    - _owrk_hp_use_grubby
+    - not _owrk_hp_boot_already_set
+  tags: [worker, execute]
+
+- name: "ORA_WRK_HP | disable Transparent HugePages persistently (Debian family)"
+  block:
+    - name: "ORA_WRK_HP | update /etc/default/grub with hugepages boot params"
+      ansible.builtin.replace:
+        path: /etc/default/grub
+        regexp: '^(GRUB_CMDLINE_LINUX=")([^"]*)(")'
+        replace: '\1\2 default_hugepagesz={{ hugepage_size_mb }}M hugepagesz={{ hugepage_size_mb }}M hugepages={{ required_hugepages_count }} transparent_hugepage=never\3'
+      register: _owrk_hp_grubcfg
+
+    - name: "ORA_WRK_HP | regenerate grub config"
+      ansible.builtin.command: update-grub
+      when: _owrk_hp_grubcfg.changed
+      register: _owrk_hp_grubby
+  when:
+    - not _owrk_hp_use_grubby
+    - not _owrk_hp_boot_already_set
+  tags: [worker, execute]
+
+- name: "ORA_WRK_HP | remove stale runtime sysctl override (if present from prior versions)"
+  ansible.builtin.file:
+    path: /etc/sysctl.d/98-oracle-hugepages.conf
+    state: absent
+  register: _owrk_hp_sysctl_removed
   tags: [worker, execute]
 
 - name: "ORA_WRK_HP | set memlock ulimit for oracle user"
@@ -25,21 +75,24 @@
 
 - name: "ORA_WRK_HP | record pending hugepage change for post-reboot validation"
   ansible.builtin.set_fact:
-    hugepages_reconfigured: true
+    hugepages_reconfigured: "{{ not _owrk_hp_boot_already_set }}"
   tags: [worker, execute]
 
 - name: "ORA_WRK_HP | display hugepages configuration summary"
   ansible.builtin.debug:
     msg: |
       ╔═══════════════════════════════════════════════════════════════╗
-      ║  Oracle Scaling — HugePages Configuration Applied              ║
+      ║  Oracle Scaling — HugePages Configuration Applied               ║
       ╚═══════════════════════════════════════════════════════════════╝
       Required HugePages Count  : {{ required_hugepages_count }} (x {{ hugepage_size_mb }} MB)
-      Sysctl File               : /etc/sysctl.d/98-oracle-hugepages.conf
-      Sysctl Change Applied     : {{ _owrk_hp_sysctl.changed }}
+      Allocation Method         : GRUB kernel boot parameter (deterministic,
+                                   not runtime sysctl - avoids fragmentation)
+      Already Set At Boot       : {{ _owrk_hp_boot_already_set }}
+      GRUB Config Updated       : {{ hugepages_reconfigured }}
+      Transparent HugePages     : DISABLED (transparent_hugepage=never)
       ────────────────────────────────────────────────────────────────
       Memlock Limit (KB)        : {{ (required_hugepages_count | int * hugepage_size_mb) }}
       Memlock Change Applied    : {{ _owrk_hp_memlock.changed }}
       ────────────────────────────────────────────────────────────────
-      NOTE: Reboot required for kernel to allocate contiguous hugepages.
+      NOTE: Reboot required for the kernel to reserve hugepages at boot.
   tags: [worker, display]

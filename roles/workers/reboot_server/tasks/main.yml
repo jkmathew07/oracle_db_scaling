@@ -25,13 +25,25 @@
   changed_when: false
   tags: [worker, execute]
 
+- name: "ORA_WRK_REBOOT | read kernel boot parameters post-reboot"
+  ansible.builtin.command: cat /proc/cmdline
+  register: _owrk_reboot_cmdline
+  changed_when: false
+  tags: [worker, execute]
+
 - name: "ORA_WRK_REBOOT | assert hugepages allocated correctly post-reboot"
   ansible.builtin.assert:
     that:
       - _owrk_hp_post_reboot.stdout | int == required_hugepages_count | int
     fail_msg: >-
       HugePages validation failed after reboot: expected {{ required_hugepages_count }},
-      got {{ _owrk_hp_post_reboot.stdout }}. Check for memory fragmentation on the host.
+      got {{ _owrk_hp_post_reboot.stdout }}.
+      Boot cmdline hugepages param present: {{ ('hugepages=' + required_hugepages_count | string) in _owrk_reboot_cmdline.stdout }}.
+      If the boot param IS present but the count is still short, the host does not
+      have enough free physical RAM at boot to satisfy the request (reduce
+      target SGA, free up other memory reservations, or check for firmware/BIOS
+      reserved memory and failed DIMMs) - this is NOT a runtime fragmentation
+      issue since allocation happened at kernel boot.
     quiet: true
   register: _owrk_hp_post_check
   tags: [worker, execute]
@@ -47,5 +59,6 @@
       ────────────────────────────────────────────────────────────────
       Expected HugePages Count : {{ required_hugepages_count }}
       Actual HugePages Count   : {{ _owrk_hp_post_reboot.stdout }}
+      Boot Param Present       : {{ ('hugepages=' + required_hugepages_count | string) in _owrk_reboot_cmdline.stdout }}
       Validation Status        : {{ 'PASSED' if not _owrk_hp_post_check.failed else 'FAILED' }}
   tags: [worker, display]
