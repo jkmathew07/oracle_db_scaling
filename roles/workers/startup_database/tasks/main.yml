@@ -1,0 +1,227 @@
+---
+# ============================================================================
+#
+#   target_mode: mount   (default) - reach MOUNT, stop there.
+#   target_mode: open    - reach MOUNT, then (Data Guard aware) open it:
+#                           PRIMARY is opened; PHYSICAL STANDBY stays MOUNT.
+#
+# Callers set target_mode via `vars:` on include_role - see orchestrator.
+# ============================================================================
+
+- name: "ORA_WRK_DB | check OS-level pmon process for this instance"
+  ansible.builtin.shell: "ps -ef | grep -i 'ora_pmon_{{ oracle_sid }}' | grep -v grep || true"
+  register: _owrk_db_pmon_check
+  changed_when: false
+  failed_when: false
+  tags: [worker, execute]
+
+- name: "ORA_WRK_DB | determine if instance process is running at OS level"
+  ansible.builtin.set_fact:
+    _owrk_db_pmon_running: "{{ (_owrk_db_pmon_check.stdout | default('')) | trim | length > 0 }}"
+  tags: [worker, execute]
+
+- name: "ORA_WRK_DB | check current instance status"
+  become: true
+  become_user: "{{ oracle_user }}"
+  environment:
+    ORACLE_HOME: "{{ oracle_home }}"
+    LD_LIBRARY_PATH: "{{ oracle_home }}/lib"
+    ORACLE_SID: "{{ oracle_sid }}"
+  ansible.builtin.command:
+    argv: ["{{ oracle_home }}/bin/sqlplus", "-s", "/", "as", "sysdba"]
+    stdin: |
+      set heading off feedback off pagesize 0 verify off echo off
+      select status from v$instance;
+      exit;
+  register: _owrk_db_status_raw
+  when: _owrk_db_pmon_running
+  changed_when: false
+  failed_when: false
+  tags: [worker, execute]
+
+- name: "ORA_WRK_DB | normalize instance status"
+  ansible.builtin.set_fact:
+    _owrk_db_status: >-
+      {{ (_owrk_db_status_raw.stdout | default('')) | trim | upper if _owrk_db_pmon_running else '' }}
+  tags: [worker, execute]
+
+# target_mode=mount specifically needs MOUNT, not OPEN (maintenance/spfile
+# changes happen in mount mode) - if it's OPEN and we only want MOUNT,
+# shut it down first. For target_mode=open this is skipped entirely: an
+# already-OPEN instance is exactly what we want, nothing to undo.
+- name: "ORA_WRK_DB | shutdown immediate if OPEN but only MOUNT was requested"
+  become: true
+  become_user: "{{ oracle_user }}"
+  environment:
+    ORACLE_HOME: "{{ oracle_home }}"
+    LD_LIBRARY_PATH: "{{ oracle_home }}/lib"
+    ORACLE_SID: "{{ oracle_sid }}"
+  ansible.builtin.command:
+    argv: ["{{ oracle_home }}/bin/sqlplus", "-s", "/", "as", "sysdba"]
+    stdin: |
+      shutdown immediate;
+      exit;
+  register: _owrk_db_shutdown
+  when:
+    - "'OPEN' in _owrk_db_status"
+    - target_mode == 'mount'
+  changed_when: true
+  # ORA-01109 is an expected notice mid-shutdown, not a failure - key off
+  # the real completion marker instead of blanket ORA- presence.
+  failed_when: "'ORACLE instance shut down' not in _owrk_db_shutdown.stdout"
+  tags: [worker, execute]
+
+- name: "ORA_WRK_DB | startup mount if instance is not up in the state we need"
+  become: true
+  become_user: "{{ oracle_user }}"
+  environment:
+    ORACLE_HOME: "{{ oracle_home }}"
+    LD_LIBRARY_PATH: "{{ oracle_home }}/lib"
+    ORACLE_SID: "{{ oracle_sid }}"
+  ansible.builtin.command:
+    argv: ["{{ oracle_home }}/bin/sqlplus", "-s", "/", "as", "sysdba"]
+    stdin: |
+      startup mount;
+      exit;
+  register: _owrk_db_startup
+  when: >-
+    _owrk_db_status == '' or
+    ('OPEN' in _owrk_db_status and target_mode == 'mount')
+  changed_when: true
+  failed_when: "'ORA-' in _owrk_db_startup.stdout"
+  tags: [worker, execute]
+
+# Single re-check, fresh, after whatever combination of the above ran (or
+# didn't). This becomes the one source of truth for everything after this
+# point - no more trusting earlier facts or return codes.
+- name: "ORA_WRK_DB | re-check instance status"
+  become: true
+  become_user: "{{ oracle_user }}"
+  environment:
+    ORACLE_HOME: "{{ oracle_home }}"
+    LD_LIBRARY_PATH: "{{ oracle_home }}/lib"
+    ORACLE_SID: "{{ oracle_sid }}"
+  ansible.builtin.command:
+    argv: ["{{ oracle_home }}/bin/sqlplus", "-s", "/", "as", "sysdba"]
+    stdin: |
+      set heading off feedback off pagesize 0 verify off echo off
+      select status from v$instance;
+      exit;
+  register: _owrk_db_status_recheck
+  changed_when: false
+  tags: [worker, execute]
+
+- name: "ORA_WRK_DB | normalize re-checked instance status"
+  ansible.builtin.set_fact:
+    _owrk_db_status: "{{ (_owrk_db_status_recheck.stdout | default('')) | trim | upper }}"
+  tags: [worker, execute]
+
+- name: "ORA_WRK_DB | assert instance reached at least MOUNT"
+  ansible.builtin.assert:
+    that:
+      - "'MOUNTED' in _owrk_db_status or 'OPEN' in _owrk_db_status"
+    fail_msg: >-
+      Instance {{ oracle_sid }} did not reach MOUNT/OPEN (status: '{{
+      _owrk_db_status }}') after startup was attempted. This may be a
+      genuinely invalid spfile rather than a transient down state - check
+      the alert log before re-running.
+    quiet: true
+  tags: [worker, execute]
+
+# ---------------------------------------------------------------------
+# Everything below only matters when target_mode: open. For target_mode:
+# mount (the default), we stop here - MOUNT is the goal and it's met.
+# ---------------------------------------------------------------------
+
+- name: "ORA_WRK_DB | check database role (Data Guard awareness)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  environment:
+    ORACLE_HOME: "{{ oracle_home }}"
+    LD_LIBRARY_PATH: "{{ oracle_home }}/lib"
+    ORACLE_SID: "{{ oracle_sid }}"
+  ansible.builtin.command:
+    argv: ["{{ oracle_home }}/bin/sqlplus", "-s", "/", "as", "sysdba"]
+    stdin: |
+      set heading off feedback off pagesize 0 verify off echo off
+      select database_role from v$database;
+      exit;
+  register: _owrk_db_role_raw
+  changed_when: false
+  when:
+    - target_mode == 'open'
+    - "'OPEN' not in _owrk_db_status"
+  tags: [worker, execute]
+
+- name: "ORA_WRK_DB | normalize database role"
+  ansible.builtin.set_fact:
+    _owrk_db_role: "{{ (_owrk_db_role_raw.stdout | default('PRIMARY')) | trim | upper }}"
+  when: target_mode == 'open'
+  tags: [worker, execute]
+
+- name: "ORA_WRK_DB | open database (PRIMARY only, only if not already OPEN)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  environment:
+    ORACLE_HOME: "{{ oracle_home }}"
+    LD_LIBRARY_PATH: "{{ oracle_home }}/lib"
+    ORACLE_SID: "{{ oracle_sid }}"
+  ansible.builtin.command:
+    argv: ["{{ oracle_home }}/bin/sqlplus", "-s", "/", "as", "sysdba"]
+    stdin: |
+      alter database open;
+      exit;
+  register: _owrk_db_open_result
+  when:
+    - target_mode == 'open'
+    - "'OPEN' not in _owrk_db_status"
+    - "'PRIMARY' in _owrk_db_role | default('')"
+  failed_when: "'ORA-' in _owrk_db_open_result.stdout"
+  tags: [worker, execute]
+
+# Informational only (does not fail the play) - confirms the open
+# instance's SGA is actually backed by hugepages. The hard guarantee
+# already happened earlier via GRUB reservation + post-reboot check.
+- name: "ORA_WRK_DB | verify hugepages are actually in use by the open instance"
+  ansible.builtin.shell: "grep -i '^HugePages_Free' /proc/meminfo | awk '{print $2}'"
+  register: _owrk_db_hp_free
+  changed_when: false
+  when:
+    - target_mode == 'open'
+    - "'PRIMARY' in _owrk_db_role | default('')"
+  tags: [worker, execute]
+
+- name: "ORA_WRK_DB | record final instance state for handoff"
+  ansible.builtin.set_fact:
+    final_instance_state: >-
+      {{ 'OPEN' if (target_mode == 'open' and (('OPEN' in _owrk_db_status) or ('PRIMARY' in (_owrk_db_role | default('')))))
+         else ('MOUNT (standby - left mounted by design)' if target_mode == 'open'
+         else 'MOUNT') }}
+  tags: [worker, execute]
+
+- name: "ORA_WRK_DB | display result summary"
+  ansible.builtin.debug:
+    msg: |
+      ╔═══════════════════════════════════════════════════════════════╗
+      ║  Oracle Scaling — Database Startup Result (target: {{ target_mode | upper }})
+      ╚═══════════════════════════════════════════════════════════════╝
+      SID                    : {{ oracle_sid }}
+      PMON Process Detected  : {{ _owrk_db_pmon_running }}
+      Status                 : {{ _owrk_db_status }}
+      ────────────────────────────────────────────────────────────────
+      {% if target_mode == 'open' %}
+      Database Role          : {{ _owrk_db_role | default('n/a - already OPEN') }}
+      {% if 'PRIMARY' in (_owrk_db_role | default('')) %}
+      Action Taken           : PRIMARY - opened for read/write
+      HugePages Free/Total   : {{ _owrk_db_hp_free.stdout | default('n/a') }} / {{ current_hugepages_total | default('n/a') }}
+      HugePages In Use       : {{ (_owrk_db_hp_free.stdout | default('0') | int) < (current_hugepages_total | default(0) | int) }}
+      {% else %}
+      Action Taken           : STANDBY - left in MOUNT by design (never opened)
+      {% endif %}
+      {% else %}
+      Action Taken           : Brought to MOUNT (target_mode=mount - no open attempted)
+      {% endif %}
+      Final Instance State   : {{ final_instance_state }}
+
+      ✔ DATABASE {{ oracle_sid }} REACHED {{ final_instance_state }}
+  tags: [worker, display]

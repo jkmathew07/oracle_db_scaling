@@ -1,7 +1,8 @@
 ---
 # "Post Scale Actions" from the workflow diagram - runs after
-# startup_database_open. Verifies both backups from this run exist, and
-# writes a summary record. Does not itself start/stop/open anything.
+# startup_database (target_mode: open). Verifies both backups from this
+# run exist, and writes a summary record. Does not itself start/stop/open
+# anything.
 
 - name: "ORA_WRK_POST | verify pfile backup was created this run"
   ansible.builtin.stat:

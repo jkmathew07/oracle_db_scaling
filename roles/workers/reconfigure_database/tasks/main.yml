@@ -1,13 +1,14 @@
 ---
-# JIT (just-in-time) verification: startup_database_mount already ran
-# earlier in the orchestrator sequence and owns bringing the instance up -
-# this role does NOT re-implement startup logic. It only confirms, right
-# before touching anything, that the instance is still in the state that
-# role left it in. If it isn't, that is surfaced as a distinct failure
-# rather than silently retried, because "instance down" and "instance
-# won't start because the spfile itself is invalid" (e.g. ORA-00823
-# sga_target > sga_max_size) are different problems - retrying startup
-# cannot fix the second one, and blindly doing so here would mask it.
+# JIT (just-in-time) verification: startup_database (target_mode: mount)
+# already ran earlier in the orchestrator sequence and owns bringing the
+# instance up - this role does NOT re-implement startup logic. It only
+# confirms, right before touching anything, that the instance is still in
+# the state that role left it in. If it isn't, that is surfaced as a
+# distinct failure rather than silently retried, because "instance down"
+# and "instance won't start because the spfile itself is invalid" (e.g.
+# ORA-00823 sga_target > sga_max_size) are different problems - retrying
+# startup cannot fix the second one, and blindly doing so here would mask
+# it.
 - name: "ORA_WRK_RECONFIG | check instance status immediately before any configuration change"
   become: true
   become_user: "{{ oracle_user }}"
@@ -39,7 +40,8 @@
       returned: '{{ _owrk_reconfig_precheck.stdout | default('no output') | trim }}').
       Refusing to take a pfile backup or change spfile parameters against an
       instance that is not confirmed up. This role does not attempt to start
-      it - that is startup_database_mount's job, earlier in this run. If
+      it - that is startup_database's (target_mode: mount) job, earlier in
+      this run. If
       that role reported success but the instance is down again now,
       investigate why it went down in between (crash, an external HA/
       monitoring agent, a spfile that is already invalid and refuses to
