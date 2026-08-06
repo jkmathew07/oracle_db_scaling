@@ -8,7 +8,7 @@
   ansible.builtin.shell: |
     {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
     set heading off feedback off pagesize 0 verify off
-    select name || ':' || value from v\$parameter
+    select upper(name) || ':' || value from v\$parameter
     where name in ('cluster_database','sga_max_size','sga_target',
     'pga_aggregate_target','pga_aggregate_limit','processes','sessions');
     exit;
@@ -21,7 +21,7 @@
   ansible.builtin.debug:
     msg: |
       ╔═══════════════════════════════════════════════════════════════╗
-      ║  Oracle Scaling — Current Instance Parameters (raw)           ║
+      ║  Oracle Scaling — Current Instance Parameters (raw)            ║
       ╚═══════════════════════════════════════════════════════════════╝
       Return code : {{ _odbcfg_current_raw.rc }}
       ────────────────────────────────────────────────────────────────
@@ -49,19 +49,19 @@
 - name: "ORA_VAL_DBCFG | compute desired-vs-current configuration delta"
   ansible.builtin.set_fact:
     db_config_already_optimal: >-
-      {{ (current_params['SGA_MAX_SIZE'] | int) == (sga_max_size_gb | int * 1073741824) and
-         (current_params['SGA_TARGET'] | int) == (sga_target_gb | int * 1073741824) and
-         (current_params['PGA_AGGREGATE_TARGET'] | int) == (pga_aggregate_target_gb | int * 1073741824) and
-         (current_params['PGA_AGGREGATE_LIMIT'] | int) == (pga_aggregate_limit_gb | int * 1073741824) and
-         (current_params['PROCESSES'] | int) == (processes | int) and
-         (current_params['SESSIONS'] | int) == (sessions | int) }}
+      {{ (current_params['SGA_MAX_SIZE'] | default(-1) | int) == (sga_max_size_gb | int * 1073741824) and
+         (current_params['SGA_TARGET'] | default(-1) | int) == (sga_target_gb | int * 1073741824) and
+         (current_params['PGA_AGGREGATE_TARGET'] | default(-1) | int) == (pga_aggregate_target_gb | int * 1073741824) and
+         (current_params['PGA_AGGREGATE_LIMIT'] | default(-1) | int) == (pga_aggregate_limit_gb | int * 1073741824) and
+         (current_params['PROCESSES'] | default(-1) | int) == (processes | int) and
+         (current_params['SESSIONS'] | default(-1) | int) == (sessions | int) }}
   tags: [validation, execute]
 
 - name: "ORA_VAL_DBCFG | display configuration comparison summary"
   ansible.builtin.debug:
     msg: |
       ╔═══════════════════════════════════════════════════════════════╗
-      ║  Oracle Scaling — DB Configuration Comparison                 ║
+      ║  Oracle Scaling — DB Configuration Comparison                  ║
       ╚═══════════════════════════════════════════════════════════════╝
       Parameter              Current (bytes/#)        Requested (GB/#)
       ────────────────────────────────────────────────────────────────
