@@ -31,7 +31,16 @@
     - ansible.builtin.include_role:
         name: validations/validate_memory
 
-    # ---------------- SCALE UP: server first, then DB ----------------
+    # ================================================================
+    # SCALE UP - matches Scale-Up Workflow diagram exactly:
+    # Validate Inputs -> Validate Memory -> Check HugePages ->
+    # Enough HugePages? -> [Configure/Persist/Reboot if No] ->
+    # Validate HugePages -> Start Database (MOUNT) ->
+    # Validate Current Parameters -> reconfigure database
+    # (pfile+spfile backup before update) -> Shutdown Database ->
+    # Startup Database (OPEN - primary only, standby stays MOUNT) ->
+    # Post Scale Actions -> Dashboard
+    # ================================================================
     - when: scale_option == 'scale_up'
       block:
         - ansible.builtin.include_role:
@@ -58,9 +67,31 @@
         - ansible.builtin.include_role:
             name: workers/shutdown_database
 
-    # ---------------- SCALE DOWN: DB first, then server ----------------
+        - ansible.builtin.include_role:
+            name: workers/startup_database_open
+
+        - ansible.builtin.include_role:
+            name: workers/post_scale_actions
+
+    # ================================================================
+    # SCALE DOWN - matches Scale-Down Workflow diagram exactly:
+    # Validate Inputs -> Validate Memory -> Check HugePages ->
+    # HugePages Over Allocated? -> [Mark for Reconfiguration if Yes] ->
+    # Start Database (MOUNT) -> reconfigure database (pfile+spfile
+    # backup before update) -> Shutdown Database -> Configure HugePages
+    # -> Reboot Server -> Startup Database (OPEN - primary only) ->
+    # Validate HugePages Configuration -> Post Scale Actions -> Dashboard
+    #
+    # NOTE: hugepages check/mark-for-reconfig runs FIRST here, before the
+    # database is even touched - this is the opposite position from
+    # scale_up, and matches the corrected diagram (it was previously,
+    # incorrectly, placed after shutdown_database - fixed).
+    # ================================================================
     - when: scale_option == 'scale_down'
       block:
+        - ansible.builtin.include_role:
+            name: validations/validate_hugepages
+
         - ansible.builtin.include_role:
             name: workers/startup_database_mount
 
@@ -75,15 +106,18 @@
             name: workers/shutdown_database
 
         - ansible.builtin.include_role:
-            name: validations/validate_hugepages
-
-        - ansible.builtin.include_role:
             name: workers/configure_hugepages
           when: not optimal_huge_pages_configured
 
         - ansible.builtin.include_role:
             name: workers/reboot_server
           when: not optimal_huge_pages_configured and allow_reboot
+
+        - ansible.builtin.include_role:
+            name: workers/startup_database_open
+
+        - ansible.builtin.include_role:
+            name: workers/post_scale_actions
 
     - ansible.builtin.include_role:
         name: dashboard/update_dashboard

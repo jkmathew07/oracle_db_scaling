@@ -1,0 +1,77 @@
+---
+# "Post Scale Actions" from the workflow diagram - runs after
+# startup_database_open. Verifies both backups from this run exist, and
+# writes a summary record. Does not itself start/stop/open anything.
+
+- name: "ORA_WRK_POST | verify pfile backup was created this run"
+  ansible.builtin.stat:
+    path: "{{ pfile_backup_dir }}/init{{ oracle_sid }}_{{ pfile_backup_ts | default('') }}.ora"
+  register: _owrk_post_pfile_check
+  when: pfile_backup_ts is defined
+  tags: [worker, execute]
+
+- name: "ORA_WRK_POST | verify spfile backup was created this run"
+  ansible.builtin.stat:
+    path: "{{ pfile_backup_dir }}/spfile{{ oracle_sid }}_{{ pfile_backup_ts | default('') }}.bkp"
+  register: _owrk_post_spfile_check
+  when: pfile_backup_ts is defined
+  tags: [worker, execute]
+
+- name: "ORA_WRK_POST | assert both backups exist if a reconfigure ran"
+  ansible.builtin.assert:
+    that:
+      - _owrk_post_pfile_check.stat.exists
+      - _owrk_post_spfile_check.stat.exists
+    fail_msg: >-
+      Expected pfile and/or spfile backup for this run was not found under
+      {{ pfile_backup_dir }} (timestamp {{ pfile_backup_ts }}). The
+      reconfigure step may not have completed as expected.
+    quiet: true
+  when: pfile_backup_ts is defined
+  tags: [worker, execute]
+
+- name: "ORA_WRK_POST | ensure log directory exists"
+  ansible.builtin.file:
+    path: "{{ log_dir }}/post_scale"
+    state: directory
+    mode: '0750'
+  tags: [worker, execute]
+
+- name: "ORA_WRK_POST | write post-scale summary record"
+  ansible.builtin.copy:
+    dest: "{{ log_dir }}/post_scale/{{ oracle_sid }}_{{ ansible_date_time.iso8601_basic_short }}.json"
+    mode: '0640'
+    content: |
+      {
+        "sid": "{{ oracle_sid }}",
+        "host": "{{ inventory_hostname }}",
+        "scale_option": "{{ scale_option }}",
+        "completed_at": "{{ ansible_date_time.iso8601 }}",
+        "final_instance_state": "{{ final_instance_state | default('unknown') }}",
+        "sga_max_size_gb": {{ sga_max_size_gb }},
+        "sga_target_gb": {{ sga_target_gb }},
+        "pga_aggregate_target_gb": {{ pga_aggregate_target_gb }},
+        "pga_aggregate_limit_gb": {{ pga_aggregate_limit_gb }},
+        "processes": {{ processes }},
+        "sessions": {{ sessions }},
+        "hugepages_reconfigured": {{ (hugepages_reconfigured | default(false)) | lower }},
+        "pfile_backup": "{{ pfile_backup_ts | default('n/a') }}",
+        "spfile_backup": "{{ ('spfile' + oracle_sid + '_' + pfile_backup_ts + '.bkp') if pfile_backup_ts is defined else 'n/a' }}",
+        "db_config_was_already_optimal": {{ (db_config_already_optimal | default(false)) | lower }}
+      }
+  register: _owrk_post_record
+  tags: [worker, execute]
+
+- name: "ORA_WRK_POST | display post-scale summary"
+  ansible.builtin.debug:
+    msg: |
+      ╔═══════════════════════════════════════════════════════════════╗
+      ║  Oracle Scaling — Post Scale Actions Summary                    ║
+      ╚═══════════════════════════════════════════════════════════════╝
+      SID                      : {{ oracle_sid }}
+      Scale Option             : {{ scale_option }}
+      Final Instance State     : {{ final_instance_state | default('unknown') }}
+      Pfile Backup Verified    : {{ _owrk_post_pfile_check.stat.exists | default('n/a - no reconfigure ran') }}
+      Spfile Backup Verified   : {{ _owrk_post_spfile_check.stat.exists | default('n/a - no reconfigure ran') }}
+      Summary Record           : {{ log_dir }}/post_scale/{{ oracle_sid }}_{{ ansible_date_time.iso8601_basic_short }}.json
+  tags: [worker, display]

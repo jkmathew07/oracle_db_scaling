@@ -104,6 +104,41 @@
       {% endif %}
   tags: [worker, display]
 
+# RMAN backup spfile (not a plain file copy) - this works correctly
+# regardless of whether the spfile lives on filesystem or in ASM, and is
+# the standard, supported way to back up and later restore a binary spfile.
+- name: "ORA_WRK_RECONFIG | create spfile backup via RMAN"
+  become: true
+  become_user: "{{ oracle_user }}"
+  environment:
+    ORACLE_HOME: "{{ oracle_home }}"
+    ORACLE_SID: "{{ oracle_sid }}"
+  ansible.builtin.shell: |
+    {{ oracle_home }}/bin/rman target / <<EOF
+    backup spfile format '{{ pfile_backup_dir }}/spfile{{ oracle_sid }}_{{ pfile_backup_ts }}.bkp';
+    exit;
+    EOF
+  register: _owrk_reconfig_spfile
+  failed_when: "'RMAN-' in _owrk_reconfig_spfile.stdout or 'ORA-' in _owrk_reconfig_spfile.stdout"
+  tags: [worker, execute]
+
+- name: "ORA_WRK_RECONFIG | display spfile backup output"
+  ansible.builtin.debug:
+    msg: |
+      ╔═══════════════════════════════════════════════════════════════╗
+      ║  Oracle Scaling — SPFILE Backup Result (RMAN)                  ║
+      ╚═══════════════════════════════════════════════════════════════╝
+      Return code : {{ _owrk_reconfig_spfile.rc }}
+      Backup Piece: {{ pfile_backup_dir }}/spfile{{ oracle_sid }}_{{ pfile_backup_ts }}.bkp
+      Restore with: RMAN> restore spfile from '{{ pfile_backup_dir }}/spfile{{ oracle_sid }}_{{ pfile_backup_ts }}.bkp';
+      ────────────────────────────────────────────────────────────────
+      {{ _owrk_reconfig_spfile.stdout | default('(no output)') | truncate(2000) }}
+      {% if _owrk_reconfig_spfile.stderr | default('') | length > 0 %}
+      STDERR:
+      {{ _owrk_reconfig_spfile.stderr | truncate(500) }}
+      {% endif %}
+  tags: [worker, display]
+
 - name: "ORA_WRK_RECONFIG | apply new parameters to spfile"
   become: true
   become_user: "{{ oracle_user }}"

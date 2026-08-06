@@ -1,20 +1,25 @@
 ---
 # ============================================================================
-# Ordering contract (flaw fix - this is the core correction from the user):
+# Ordering contract - matches the Scale-Up / Scale-Down Workflow diagrams
+# exactly. This var is documentation only (the orchestrator role hardcodes
+# the actual sequence); kept here so the sequence is visible without
+# reading the orchestrator's Jinja conditionals.
 #
-# scale_up:   Server scales FIRST (RAM/hugepages already bigger, done outside
-#             or by this play's worker roles), THEN Database configuration
-#             is increased. Rationale: DB must never be asked to allocate more
-#             SGA than the CURRENT server can hold.
+# scale_up:   HugePages check runs FIRST (server scales before DB) - the
+#             instance must never be asked to hold more SGA than the
+#             CURRENT server can back.
 #
-# scale_down: Database scales FIRST (SGA/PGA reduced while the server still
-#             has the OLD, larger RAM/hugepages available), THEN the Server
-#             scales down (hugepages shrunk to match the new smaller SGA,
-#             then reboot onto the smaller RAM). Rationale: shrinking the
-#             server first would leave the running instance unable to hold
-#             its old, still-large SGA => instance won't come back up.
+# scale_down: HugePages check ALSO runs FIRST here (opposite reasoning) -
+#             it only marks whether reconfiguration will be needed later;
+#             the actual server shrink+reboot happens AFTER the DB has
+#             already been scaled down and shut down, while the OLD larger
+#             RAM/hugepages are still present. Shrinking the server before
+#             the DB would strand a running instance holding a now-too-
+#             large SGA.
 #
-# The orchestrator role below is the single place that encodes this order.
+# Both paths open the database at the end (Data Guard aware - only a
+# PRIMARY is opened; a PHYSICAL STANDBY always stays in MOUNT), then run
+# Post Scale Actions before the dashboard/log steps.
 # ============================================================================
 
 workflow_steps:
@@ -22,24 +27,30 @@ workflow_steps:
     - validate_input
     - validate_memory
     - validate_hugepages
-    - configure_hugepages      # conditional - only if not already optimal
-    - reboot_server            # conditional - only if hugepages changed
+    - configure_hugepages          # conditional - only if not already optimal
+    - reboot_server                # conditional - only if hugepages changed
     - startup_database_mount
-    - create_pfile_backup
     - validate_db_configuration
-    - reconfigure_database
+    - reconfigure_database         # conditional - only if not already optimal;
+                                    # backs up BOTH pfile and spfile before any change
     - shutdown_database
+    - startup_database_open        # Data Guard aware - PRIMARY only
+    - post_scale_actions
     - update_dashboard
+    - write_log
 
   scale_down:
     - validate_input
     - validate_memory
+    - validate_hugepages           # runs FIRST here - marks reconfig need only
     - startup_database_mount
-    - create_pfile_backup
     - validate_db_configuration
-    - reconfigure_database
+    - reconfigure_database         # conditional; backs up BOTH pfile and spfile
     - shutdown_database
-    - validate_hugepages
-    - configure_hugepages      # conditional - only if over-allocated vs new SGA
-    - reboot_server            # conditional - only if hugepages changed
+    - configure_hugepages          # conditional - only if over-allocated vs new SGA
+    - reboot_server                # conditional - only if hugepages changed
+    - startup_database_open        # Data Guard aware - PRIMARY only; also
+                                    # verifies hugepages are actually in use
+    - post_scale_actions
     - update_dashboard
+    - write_log
