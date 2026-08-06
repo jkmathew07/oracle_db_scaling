@@ -21,7 +21,7 @@
   ansible.builtin.debug:
     msg: |
       ╔═══════════════════════════════════════════════════════════════╗
-      ║  Oracle Scaling — Current Instance Parameters (raw)            ║
+      ║  Oracle Scaling — Current Instance Parameters (raw)           ║
       ╚═══════════════════════════════════════════════════════════════╝
       Return code : {{ _odbcfg_current_raw.rc }}
       ────────────────────────────────────────────────────────────────
@@ -61,7 +61,7 @@
   ansible.builtin.debug:
     msg: |
       ╔═══════════════════════════════════════════════════════════════╗
-      ║  Oracle Scaling — DB Configuration Comparison                  ║
+      ║  Oracle Scaling — DB Configuration Comparison                 ║
       ╚═══════════════════════════════════════════════════════════════╝
       Parameter              Current (bytes/#)        Requested (GB/#)
       ────────────────────────────────────────────────────────────────
