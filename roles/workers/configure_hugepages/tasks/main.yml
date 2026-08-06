@@ -147,7 +147,20 @@
     path: /etc/rc.d/rc.local
     regexp: '^([[:space:]]*)sysctl[[:space:]]+-w[[:space:]]+vm\.nr_hugepages=.*$'
     replace: '\1# vm.nr_hugepages override removed by oracle_db_scaling - hugepages now managed via GRUB boot parameter (see /proc/cmdline)'
+    multiline: true
   register: _owrk_hp_rclocal_neutralized
+  when: _owrk_hp_rclocal_scan.stdout | length > 0
+  tags: [worker, execute]
+
+- name: "ORA_WRK_HP | verify rc.local override was actually neutralized"
+  ansible.builtin.assert:
+    that:
+      - _owrk_hp_rclocal_neutralized.changed
+    fail_msg: >-
+      Detected a legacy hugepages override in rc.local but the replace did
+      NOT modify the file (regexp did not match) - the override is still
+      active. Check the exact line format in /etc/rc.d/rc.local manually.
+    quiet: true
   when: _owrk_hp_rclocal_scan.stdout | length > 0
   tags: [worker, execute]
 
@@ -171,9 +184,23 @@
     path: "{{ item }}"
     regexp: '^([[:space:]]*)vm\.nr_hugepages([[:space:]]*=.*)$'
     replace: '\1# vm.nr_hugepages managed by oracle_db_scaling via GRUB boot parameter - see /proc/cmdline (was:\2)'
+    multiline: true
   loop: "{{ _owrk_hp_conflicting_files.stdout_lines }}"
   when: _owrk_hp_conflicting_files.stdout_lines | length > 0
   register: _owrk_hp_conflicts_neutralized
+  tags: [worker, execute]
+
+- name: "ORA_WRK_HP | verify each conflicting sysctl source was actually neutralized"
+  ansible.builtin.assert:
+    that:
+      - item.changed
+    fail_msg: >-
+      Detected vm.nr_hugepages in {{ item.item }} but the replace did NOT
+      modify the file (regexp did not match) - the conflicting entry is
+      still active. Check the exact line format in that file manually.
+    quiet: true
+  loop: "{{ _owrk_hp_conflicts_neutralized.results | default([]) }}"
+  when: _owrk_hp_conflicting_files.stdout_lines | length > 0
   tags: [worker, execute]
 
 - name: "ORA_WRK_HP | set memlock ulimit for oracle user"
@@ -210,10 +237,10 @@
       Firstboot Service Masked  : {{ _owrk_hp_preinstall_svc.stdout | trim | length > 0 }}
       ────────────────────────────────────────────────────────────────
       Legacy rc.local override  : {{ 'FOUND — ' + _owrk_hp_rclocal_scan.stdout if _owrk_hp_rclocal_scan.stdout | length > 0 else 'not found - untouched' }}
-      rc.local Neutralized      : {{ _owrk_hp_rclocal_scan.stdout | length > 0 }}
+      rc.local Neutralized      : {{ _owrk_hp_rclocal_neutralized.changed | default(false) }}
       ────────────────────────────────────────────────────────────────
       Conflicting sysctl files  : {{ _owrk_hp_conflicting_files.stdout_lines | join(', ') if _owrk_hp_conflicting_files.stdout_lines | length > 0 else 'not found - untouched' }}
-      Conflicts Neutralized     : {{ _owrk_hp_conflicting_files.stdout_lines | length > 0 }}
+      Conflicts Neutralized     : {{ (_owrk_hp_conflicts_neutralized.results | default([]) | map(attribute='changed') | list) if _owrk_hp_conflicting_files.stdout_lines | length > 0 else 'n/a' }}
       ────────────────────────────────────────────────────────────────
       Memlock Limit (KB)        : {{ (required_hugepages_count | int * hugepage_size_mb) }}
       Memlock Change Applied    : {{ _owrk_hp_memlock.changed }}
