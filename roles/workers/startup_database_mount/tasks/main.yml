@@ -1,4 +1,10 @@
 ---
+# Querying v$instance via sqlplus when the instance is completely down (no
+# pmon/background processes at all) can behave inconsistently depending on
+# environment (ORA-01034, hangs waiting on a stale shared memory segment,
+# etc). Checking the OS process first avoids running that query at all in
+# the "definitely down" case - we already know the answer, so go straight
+# to startup mount instead of asking Oracle a question it can't answer.
 
 - name: "ORA_WRK_STARTUP | Check OS-level pmon process for this instance"
   ansible.builtin.shell: "ps -ef | grep -i 'ora_pmon_{{ oracle_sid }}' | grep -v grep || true"
@@ -73,7 +79,11 @@
   register: _owrk_startup_shutdown
   when: "'OPEN' in instance_status"
   changed_when: true
-  failed_when: "'ORA-' in _owrk_startup_shutdown.stdout"
+  # Same fix as shutdown_database role: ORA-01109 "database not open" is an
+  # expected notice, not a failure, if this ever races against the DB
+  # closing between the status check and this command. Key off the actual
+  # success confirmation line instead of blanket ORA- presence.
+  failed_when: "'ORACLE instance shut down' not in _owrk_startup_shutdown.stdout"
   tags:
     - worker
     - execute

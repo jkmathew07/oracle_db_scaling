@@ -29,7 +29,13 @@
     EOF
   register: _owrk_shutdown_result
   when: _owrk_shutdown_status.stdout is defined and _owrk_shutdown_status.stdout | trim != ''
-  failed_when: "'ORA-' in _owrk_shutdown_result.stdout"
+  # ORA-01109 "database not open" is EXPECTED, informational output when
+  # shutting down an instance that's only in MOUNT (not OPEN) - Oracle
+  # still proceeds to dismount and shut down cleanly. A blanket "any
+  # ORA- string = failure" check would wrongly fail on this. The real
+  # success signal is the final confirmation line Oracle always prints
+  # when shutdown genuinely completes, regardless of prior state.
+  failed_when: "'ORACLE instance shut down' not in _owrk_shutdown_result.stdout"
   tags: [worker, execute]
 
 - name: "ORA_WRK_SHUTDOWN | display shutdown action output"
