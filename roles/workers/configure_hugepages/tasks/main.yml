@@ -145,9 +145,8 @@
 - name: "ORA_WRK_HP | neutralize legacy rc.local hugepages override"
   ansible.builtin.replace:
     path: /etc/rc.d/rc.local
-    regexp: '^([[:space:]]*)sysctl[[:space:]]+-w[[:space:]]+vm\.nr_hugepages=.*$'
+    regexp: '^(\s*)sysctl\s+-w\s+vm\.nr_hugepages=.*$'
     replace: '\1# vm.nr_hugepages override removed by oracle_db_scaling - hugepages now managed via GRUB boot parameter (see /proc/cmdline)'
-    multiline: true
   register: _owrk_hp_rclocal_neutralized
   when: _owrk_hp_rclocal_scan.stdout | length > 0
   tags: [worker, execute]
@@ -182,9 +181,8 @@
 - name: "ORA_WRK_HP | neutralize conflicting vm.nr_hugepages entries in other sysctl sources"
   ansible.builtin.replace:
     path: "{{ item }}"
-    regexp: '^([[:space:]]*)vm\.nr_hugepages([[:space:]]*=.*)$'
+    regexp: '^(\s*)vm\.nr_hugepages(\s*=.*)$'
     replace: '\1# vm.nr_hugepages managed by oracle_db_scaling via GRUB boot parameter - see /proc/cmdline (was:\2)'
-    multiline: true
   loop: "{{ _owrk_hp_conflicting_files.stdout_lines }}"
   when: _owrk_hp_conflicting_files.stdout_lines | length > 0
   register: _owrk_hp_conflicts_neutralized
