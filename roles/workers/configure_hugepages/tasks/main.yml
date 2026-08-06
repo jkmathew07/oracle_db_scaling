@@ -64,6 +64,31 @@
   register: _owrk_hp_sysctl_removed
   tags: [worker, execute]
 
+# systemd-sysctl.service applies ALL sysctl.conf/sysctl.d sources AFTER the
+# kernel's own boot-time GRUB hugepages reservation. If any OTHER file
+# (commonly written by Oracle's RDBMS preinstall RPM, or a manual admin
+# change) still sets vm.nr_hugepages, it silently overrides our GRUB value
+# on every boot - this is why the actual count can get stuck at an old
+# number regardless of what the GRUB parameter requests.
+- name: "ORA_WRK_HP | scan all sysctl sources for conflicting vm.nr_hugepages entries"
+  ansible.builtin.shell: >
+    grep -rlE '^[[:space:]]*vm\.nr_hugepages[[:space:]]*=' 
+    /etc/sysctl.conf /etc/sysctl.d/*.conf /usr/lib/sysctl.d/*.conf /run/sysctl.d/*.conf
+    2>/dev/null || true
+  register: _owrk_hp_conflicting_files
+  changed_when: false
+  tags: [worker, execute]
+
+- name: "ORA_WRK_HP | neutralize conflicting vm.nr_hugepages entries in other sysctl sources"
+  ansible.builtin.replace:
+    path: "{{ item }}"
+    regexp: '^([[:space:]]*)vm\.nr_hugepages([[:space:]]*=.*)$'
+    replace: '\1# vm.nr_hugepages managed by oracle_db_scaling via GRUB boot parameter - see /proc/cmdline (was:\2)'
+  loop: "{{ _owrk_hp_conflicting_files.stdout_lines }}"
+  when: _owrk_hp_conflicting_files.stdout_lines | length > 0
+  register: _owrk_hp_conflicts_neutralized
+  tags: [worker, execute]
+
 - name: "ORA_WRK_HP | set memlock ulimit for oracle user"
   community.general.pam_limits:
     domain: "{{ oracle_user }}"
@@ -90,6 +115,9 @@
       Already Set At Boot       : {{ _owrk_hp_boot_already_set }}
       GRUB Config Updated       : {{ hugepages_reconfigured }}
       Transparent HugePages     : DISABLED (transparent_hugepage=never)
+      ────────────────────────────────────────────────────────────────
+      Conflicting sysctl files  : {{ _owrk_hp_conflicting_files.stdout_lines | join(', ') if _owrk_hp_conflicting_files.stdout_lines | length > 0 else 'none found' }}
+      Conflicts Neutralized     : {{ _owrk_hp_conflicting_files.stdout_lines | length > 0 }}
       ────────────────────────────────────────────────────────────────
       Memlock Limit (KB)        : {{ (required_hugepages_count | int * hugepage_size_mb) }}
       Memlock Change Applied    : {{ _owrk_hp_memlock.changed }}
