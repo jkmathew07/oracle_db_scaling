@@ -1,0 +1,45 @@
+---
+- name: "ORA_WRK_HP | compute required hugepage count"
+  ansible.builtin.set_fact:
+    required_hugepages_count: "{{ ((target_hugepages_gb_max | float) * 1024 / hugepage_size_mb) | round(0, 'ceil') | int }}"
+  tags: [worker, execute]
+
+- name: "ORA_WRK_HP | persist vm.nr_hugepages via sysctl"
+  ansible.posix.sysctl:
+    name: vm.nr_hugepages
+    value: "{{ required_hugepages_count }}"
+    sysctl_file: /etc/sysctl.d/98-oracle-hugepages.conf
+    state: present
+    reload: false
+  register: _owrk_hp_sysctl
+  tags: [worker, execute]
+
+- name: "ORA_WRK_HP | set memlock ulimit for oracle user"
+  community.general.pam_limits:
+    domain: "{{ oracle_user }}"
+    limit_type: "-"
+    limit_item: memlock
+    value: "{{ (required_hugepages_count | int * hugepage_size_mb) }}"
+  register: _owrk_hp_memlock
+  tags: [worker, execute]
+
+- name: "ORA_WRK_HP | record pending hugepage change for post-reboot validation"
+  ansible.builtin.set_fact:
+    hugepages_reconfigured: true
+  tags: [worker, execute]
+
+- name: "ORA_WRK_HP | display hugepages configuration summary"
+  ansible.builtin.debug:
+    msg: |
+      ╔═══════════════════════════════════════════════════════════════╗
+      ║  Oracle Scaling — HugePages Configuration Applied              ║
+      ╚═══════════════════════════════════════════════════════════════╝
+      Required HugePages Count  : {{ required_hugepages_count }} (x {{ hugepage_size_mb }} MB)
+      Sysctl File               : /etc/sysctl.d/98-oracle-hugepages.conf
+      Sysctl Change Applied     : {{ _owrk_hp_sysctl.changed }}
+      ────────────────────────────────────────────────────────────────
+      Memlock Limit (KB)        : {{ (required_hugepages_count | int * hugepage_size_mb) }}
+      Memlock Change Applied    : {{ _owrk_hp_memlock.changed }}
+      ────────────────────────────────────────────────────────────────
+      NOTE: Reboot required for kernel to allocate contiguous hugepages.
+  tags: [worker, display]

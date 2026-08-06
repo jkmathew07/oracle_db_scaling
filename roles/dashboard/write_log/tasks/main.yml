@@ -1,0 +1,31 @@
+---
+- name: "ORA_DASH_LOG | ensure log directory exists"
+  ansible.builtin.file:
+    path: "{{ log_dir }}"
+    state: directory
+    mode: '0750'
+  tags: [dashboard, execute]
+
+- name: "ORA_DASH_LOG | append run summary to audit log"
+  ansible.builtin.lineinfile:
+    path: "{{ log_dir }}/{{ oracle_sid }}_scaling.log"
+    create: true
+    mode: '0640'
+    line: >-
+      {{ ansible_date_time.iso8601 }} host={{ inventory_hostname }}
+      sid={{ oracle_sid }} scale_option={{ scale_option }}
+      sga_max_size_gb={{ sga_max_size_gb }} pga_target_gb={{ pga_aggregate_target_gb }}
+      hugepages_reconfigured={{ hugepages_reconfigured | default(false) }}
+      pfile_backup={{ pfile_backup_ts | default('n/a') }}
+  register: _odash_log_result
+  tags: [dashboard, execute]
+
+- name: "ORA_DASH_LOG | display audit log entry"
+  ansible.builtin.debug:
+    msg: |
+      ╔═══════════════════════════════════════════════════════════════╗
+      ║  Oracle Scaling — Audit Log Entry Written                      ║
+      ╚═══════════════════════════════════════════════════════════════╝
+      Log File : {{ log_dir }}/{{ oracle_sid }}_scaling.log
+      Entry    : {{ 'WRITTEN' if _odash_log_result.changed else 'ALREADY PRESENT (idempotent)' }}
+  tags: [dashboard, display]

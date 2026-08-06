@@ -1,0 +1,97 @@
+---
+# Lock acquire
+- name: Check for existing lock
+  ansible.builtin.stat:
+    path: "{{ lock_file }}"
+  register: lock_stat
+
+- name: Fail if locked and not stale
+  ansible.builtin.fail:
+    msg: "Another scaling run is active for {{ oracle_sid }} ({{ lock_file }})"
+  when:
+    - lock_stat.stat.exists
+    - (ansible_date_time.epoch | int) - (lock_stat.stat.mtime | int) < lock_timeout_seconds
+
+- name: Create lock dir
+  ansible.builtin.file:
+    path: "{{ lock_dir }}"
+    state: directory
+    mode: '0755'
+
+- name: Acquire lock
+  ansible.builtin.copy:
+    dest: "{{ lock_file }}"
+    content: "{{ ansible_date_time.iso8601 }} scale_option={{ scale_option }}"
+    mode: '0644'
+
+- block:
+    - ansible.builtin.include_role:
+        name: validations/validate_input
+
+    - ansible.builtin.include_role:
+        name: validations/validate_memory
+
+    # ---------------- SCALE UP: server first, then DB ----------------
+    - when: scale_option == 'scale_up'
+      block:
+        - ansible.builtin.include_role:
+            name: validations/validate_hugepages
+
+        - ansible.builtin.include_role:
+            name: workers/configure_hugepages
+          when: not optimal_huge_pages_configured
+
+        - ansible.builtin.include_role:
+            name: workers/reboot_server
+          when: not optimal_huge_pages_configured and allow_reboot
+
+        - ansible.builtin.include_role:
+            name: workers/startup_database_mount
+
+        - ansible.builtin.include_role:
+            name: validations/validate_db_configuration
+
+        - ansible.builtin.include_role:
+            name: workers/reconfigure_database
+          when: not db_config_already_optimal
+
+        - ansible.builtin.include_role:
+            name: workers/shutdown_database
+
+    # ---------------- SCALE DOWN: DB first, then server ----------------
+    - when: scale_option == 'scale_down'
+      block:
+        - ansible.builtin.include_role:
+            name: workers/startup_database_mount
+
+        - ansible.builtin.include_role:
+            name: validations/validate_db_configuration
+
+        - ansible.builtin.include_role:
+            name: workers/reconfigure_database
+          when: not db_config_already_optimal
+
+        - ansible.builtin.include_role:
+            name: workers/shutdown_database
+
+        - ansible.builtin.include_role:
+            name: validations/validate_hugepages
+
+        - ansible.builtin.include_role:
+            name: workers/configure_hugepages
+          when: not optimal_huge_pages_configured
+
+        - ansible.builtin.include_role:
+            name: workers/reboot_server
+          when: not optimal_huge_pages_configured and allow_reboot
+
+    - ansible.builtin.include_role:
+        name: dashboard/update_dashboard
+
+    - ansible.builtin.include_role:
+        name: dashboard/write_log
+  always:
+    - name: Release lock
+      ansible.builtin.file:
+        path: "{{ lock_file }}"
+        state: absent

@@ -1,0 +1,87 @@
+---
+- name: "ORA_WRK_RECONFIG | ensure pfile backup directory exists"
+  become: true
+  become_user: "{{ oracle_user }}"
+  ansible.builtin.file:
+    path: "{{ pfile_backup_dir }}"
+    state: directory
+    mode: '0750'
+  tags: [worker, execute]
+
+- name: "ORA_WRK_RECONFIG | set backup timestamp"
+  ansible.builtin.set_fact:
+    pfile_backup_ts: "{{ ansible_date_time.iso8601_basic_short }}"
+  tags: [worker, execute]
+
+- name: "ORA_WRK_RECONFIG | create pfile backup from current spfile"
+  become: true
+  become_user: "{{ oracle_user }}"
+  environment:
+    ORACLE_HOME: "{{ oracle_home }}"
+    ORACLE_SID: "{{ oracle_sid }}"
+  ansible.builtin.shell: |
+    {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    create pfile='{{ pfile_backup_dir }}/init{{ oracle_sid }}_{{ pfile_backup_ts }}.ora' from spfile;
+    exit;
+    EOF
+  register: _owrk_reconfig_pfile
+  failed_when: "'ORA-' in _owrk_reconfig_pfile.stdout"
+  tags: [worker, execute]
+
+- name: "ORA_WRK_RECONFIG | display pfile backup output"
+  ansible.builtin.debug:
+    msg: |
+      ╔═══════════════════════════════════════════════════════════════╗
+      ║  Oracle Scaling — PFILE Backup Result                         ║
+      ╚═══════════════════════════════════════════════════════════════╝
+      Return code : {{ _owrk_reconfig_pfile.rc }}
+      Backup Path : {{ pfile_backup_dir }}/init{{ oracle_sid }}_{{ pfile_backup_ts }}.ora
+      ────────────────────────────────────────────────────────────────
+      {{ _owrk_reconfig_pfile.stdout | default('(no output)') | truncate(2000) }}
+      {% if _owrk_reconfig_pfile.stderr | default('') | length > 0 %}
+      STDERR:
+      {{ _owrk_reconfig_pfile.stderr | truncate(500) }}
+      {% endif %}
+  tags: [worker, display]
+
+- name: "ORA_WRK_RECONFIG | apply new parameters to spfile"
+  become: true
+  become_user: "{{ oracle_user }}"
+  environment:
+    ORACLE_HOME: "{{ oracle_home }}"
+    ORACLE_SID: "{{ oracle_sid }}"
+  ansible.builtin.shell: |
+    {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    alter system set sga_max_size={{ sga_max_size_gb }}G scope=spfile;
+    alter system set sga_target={{ sga_target_gb }}G scope=spfile;
+    alter system set pga_aggregate_target={{ pga_aggregate_target_gb }}G scope=spfile;
+    alter system set pga_aggregate_limit={{ pga_aggregate_limit_gb }}G scope=spfile;
+    alter system set processes={{ processes }} scope=spfile;
+    alter system set sessions={{ sessions }} scope=spfile;
+    exit;
+    EOF
+  register: _owrk_reconfig_apply
+  failed_when: "'ORA-' in _owrk_reconfig_apply.stdout"
+  tags: [worker, execute]
+
+- name: "ORA_WRK_RECONFIG | display spfile parameter change output"
+  ansible.builtin.debug:
+    msg: |
+      ╔═══════════════════════════════════════════════════════════════╗
+      ║  Oracle Scaling — SPFILE Parameter Change Result               ║
+      ╚═══════════════════════════════════════════════════════════════╝
+      Return code : {{ _owrk_reconfig_apply.rc }}
+      ────────────────────────────────────────────────────────────────
+      SGA_MAX_SIZE          -> {{ sga_max_size_gb }}G
+      SGA_TARGET            -> {{ sga_target_gb }}G
+      PGA_AGGREGATE_TARGET  -> {{ pga_aggregate_target_gb }}G
+      PGA_AGGREGATE_LIMIT   -> {{ pga_aggregate_limit_gb }}G
+      PROCESSES             -> {{ processes }}
+      SESSIONS              -> {{ sessions }}
+      ────────────────────────────────────────────────────────────────
+      {{ _owrk_reconfig_apply.stdout | default('(no output)') | truncate(2000) }}
+      {% if _owrk_reconfig_apply.stderr | default('') | length > 0 %}
+      STDERR:
+      {{ _owrk_reconfig_apply.stderr | truncate(500) }}
+      {% endif %}
+  tags: [worker, display]

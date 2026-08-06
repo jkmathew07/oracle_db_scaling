@@ -1,0 +1,60 @@
+---
+- name: "ORA_WRK_SHUTDOWN | check instance status before shutdown"
+  become: true
+  become_user: "{{ oracle_user }}"
+  environment:
+    ORACLE_HOME: "{{ oracle_home }}"
+    ORACLE_SID: "{{ oracle_sid }}"
+  ansible.builtin.shell: |
+    {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    set heading off feedback off pagesize 0
+    select status from v\$instance;
+    exit;
+    EOF
+  register: _owrk_shutdown_status
+  changed_when: false
+  failed_when: false
+  tags: [worker, execute]
+
+- name: "ORA_WRK_SHUTDOWN | shutdown immediate"
+  become: true
+  become_user: "{{ oracle_user }}"
+  environment:
+    ORACLE_HOME: "{{ oracle_home }}"
+    ORACLE_SID: "{{ oracle_sid }}"
+  ansible.builtin.shell: |
+    {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    shutdown immediate;
+    exit;
+    EOF
+  register: _owrk_shutdown_result
+  when: _owrk_shutdown_status.stdout is defined and _owrk_shutdown_status.stdout | trim != ''
+  failed_when: "'ORA-' in _owrk_shutdown_result.stdout"
+  tags: [worker, execute]
+
+- name: "ORA_WRK_SHUTDOWN | display shutdown action output"
+  ansible.builtin.debug:
+    msg: |
+      ╔═══════════════════════════════════════════════════════════════╗
+      ║  Oracle Scaling — Instance Shutdown Output                     ║
+      ╚═══════════════════════════════════════════════════════════════╝
+      Return code : {{ _owrk_shutdown_result.rc | default('n/a') }}
+      ────────────────────────────────────────────────────────────────
+      {{ _owrk_shutdown_result.stdout | default('(instance was already down - no action taken)') | truncate(2000) }}
+      {% if _owrk_shutdown_result.stderr | default('') | length > 0 %}
+      STDERR:
+      {{ _owrk_shutdown_result.stderr | truncate(500) }}
+      {% endif %}
+  tags: [worker, display]
+
+- name: "ORA_WRK_SHUTDOWN | display final instance state summary"
+  ansible.builtin.debug:
+    msg: |
+      ╔═══════════════════════════════════════════════════════════════╗
+      ║  Oracle Scaling — Final Instance State Summary                 ║
+      ╚═══════════════════════════════════════════════════════════════╝
+      SID                  : {{ oracle_sid }}
+      Status Before Action : {{ _owrk_shutdown_status.stdout | default('') | trim if _owrk_shutdown_status.stdout | default('') | trim != '' else 'DOWN' }}
+      Action Taken         : {{ 'SHUTDOWN IMMEDIATE' if _owrk_shutdown_status.stdout | default('') | trim != '' else 'NONE — already down' }}
+      Final State          : DOWN (instance-open handled by post-maintenance role)
+  tags: [worker, display]

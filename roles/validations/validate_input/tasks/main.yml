@@ -1,0 +1,49 @@
+---
+- name: "ORA_VAL_INPUT | assert mandatory parameters present"
+  ansible.builtin.assert:
+    that:
+      - scale_option in ['scale_up', 'scale_down']
+      - sga_max_size_gb is defined
+      - sga_target_gb is defined
+      - pga_aggregate_target_gb is defined
+      - pga_aggregate_limit_gb is defined
+      - processes is defined
+      - sessions is defined
+      - target_server_ram_gb is defined
+      - db_sid is defined
+    fail_msg: "Missing/invalid required input parameters for {{ scale_option }}"
+    quiet: true
+  register: _oval_input_presence
+  tags: [validation, execute]
+
+- name: "ORA_VAL_INPUT | assert numeric sanity of inputs"
+  ansible.builtin.assert:
+    that:
+      - sga_max_size_gb | int > 0
+      - pga_aggregate_target_gb | int > 0
+      - pga_aggregate_limit_gb | int >= (pga_aggregate_target_gb | int)
+      - target_server_ram_gb | int > 0
+    fail_msg: "Invalid numeric parameter configuration"
+    quiet: true
+  register: _oval_input_numeric
+  tags: [validation, execute]
+
+- name: "ORA_VAL_INPUT | display input validation summary"
+  ansible.builtin.debug:
+    msg: |
+      ╔═══════════════════════════════════════════════════════════════╗
+      ║  Oracle Scaling — Input Validation Summary                    ║
+      ╚═══════════════════════════════════════════════════════════════╝
+      Scale Option          : {{ scale_option }}
+      DB SID                : {{ db_sid }}
+      SGA_MAX_SIZE (GB)     : {{ sga_max_size_gb }}
+      SGA_TARGET (GB)       : {{ sga_target_gb }}
+      PGA_AGGR_TARGET (GB)  : {{ pga_aggregate_target_gb }}
+      PGA_AGGR_LIMIT (GB)   : {{ pga_aggregate_limit_gb }}
+      PROCESSES             : {{ processes }}
+      SESSIONS              : {{ sessions }}
+      Target Server RAM(GB) : {{ target_server_ram_gb }}
+      ────────────────────────────────────────────────────────────────
+      Mandatory fields check : {{ 'PASSED' if not _oval_input_presence.failed else 'FAILED' }}
+      Numeric sanity check   : {{ 'PASSED' if not _oval_input_numeric.failed else 'FAILED' }}
+  tags: [validation, display]

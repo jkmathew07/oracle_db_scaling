@@ -1,0 +1,29 @@
+---
+- name: "ORA_DASH_UPDATE | post run status to dashboard endpoint"
+  ansible.builtin.uri:
+    url: "{{ dashboard_endpoint }}"
+    method: POST
+    body_format: json
+    status_code: [200, 201]
+    body:
+      sid: "{{ oracle_sid }}"
+      host: "{{ inventory_hostname }}"
+      scale_option: "{{ scale_option }}"
+      sga_max_size_gb: "{{ sga_max_size_gb }}"
+      hugepages_reconfigured: "{{ hugepages_reconfigured | default(false) }}"
+      timestamp: "{{ ansible_date_time.iso8601 }}"
+  register: _odash_update_result
+  when: dashboard_endpoint | length > 0
+  ignore_errors: true
+  tags: [dashboard, execute]
+
+- name: "ORA_DASH_UPDATE | display dashboard callback result"
+  ansible.builtin.debug:
+    msg: |
+      ╔═══════════════════════════════════════════════════════════════╗
+      ║  Oracle Scaling — Dashboard Callback Result                    ║
+      ╚═══════════════════════════════════════════════════════════════╝
+      Endpoint     : {{ dashboard_endpoint if dashboard_endpoint | length > 0 else 'NOT CONFIGURED' }}
+      HTTP Status  : {{ _odash_update_result.status | default('n/a') }}
+      Call Result  : {{ 'SKIPPED — no endpoint configured' if dashboard_endpoint | length == 0 else ('SUCCESS' if not _odash_update_result.failed else 'FAILED (non-blocking)') }}
+  tags: [dashboard, display]

@@ -1,0 +1,51 @@
+---
+- name: "ORA_WRK_REBOOT | display pre-reboot notice"
+  ansible.builtin.debug:
+    msg: |
+      ╔═══════════════════════════════════════════════════════════════╗
+      ║  Oracle Scaling — Server Reboot Initiated                      ║
+      ╚═══════════════════════════════════════════════════════════════╝
+      Host                : {{ inventory_hostname }}
+      Reason              : HugePages reconfiguration ({{ scale_option }})
+      Reboot Timeout (s)  : 600
+  tags: [worker, display]
+
+- name: "ORA_WRK_REBOOT | reboot host and wait for reconnect"
+  ansible.builtin.reboot:
+    reboot_timeout: 600
+    pre_reboot_delay: 5
+    post_reboot_delay: 15
+    test_command: uptime
+  register: _owrk_reboot_result
+  tags: [worker, execute]
+
+- name: "ORA_WRK_REBOOT | re-check HugePages_Total after reboot"
+  ansible.builtin.shell: "grep -i '^HugePages_Total' /proc/meminfo | awk '{print $2}'"
+  register: _owrk_hp_post_reboot
+  changed_when: false
+  tags: [worker, execute]
+
+- name: "ORA_WRK_REBOOT | assert hugepages allocated correctly post-reboot"
+  ansible.builtin.assert:
+    that:
+      - _owrk_hp_post_reboot.stdout | int == required_hugepages_count | int
+    fail_msg: >-
+      HugePages validation failed after reboot: expected {{ required_hugepages_count }},
+      got {{ _owrk_hp_post_reboot.stdout }}. Check for memory fragmentation on the host.
+    quiet: true
+  register: _owrk_hp_post_check
+  tags: [worker, execute]
+
+- name: "ORA_WRK_REBOOT | display post-reboot validation summary"
+  ansible.builtin.debug:
+    msg: |
+      ╔═══════════════════════════════════════════════════════════════╗
+      ║  Oracle Scaling — Post-Reboot HugePages Validation              ║
+      ╚═══════════════════════════════════════════════════════════════╝
+      Host                     : {{ inventory_hostname }}
+      Reboot Result            : {{ 'SUCCESS' if not _owrk_reboot_result.failed else 'FAILED' }}
+      ────────────────────────────────────────────────────────────────
+      Expected HugePages Count : {{ required_hugepages_count }}
+      Actual HugePages Count   : {{ _owrk_hp_post_reboot.stdout }}
+      Validation Status        : {{ 'PASSED' if not _owrk_hp_post_check.failed else 'FAILED' }}
+  tags: [worker, display]

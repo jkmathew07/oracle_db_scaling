@@ -1,0 +1,45 @@
+---
+# ============================================================================
+# Ordering contract (flaw fix - this is the core correction from the user):
+#
+# scale_up:   Server scales FIRST (RAM/hugepages already bigger, done outside
+#             or by this play's worker roles), THEN Database configuration
+#             is increased. Rationale: DB must never be asked to allocate more
+#             SGA than the CURRENT server can hold.
+#
+# scale_down: Database scales FIRST (SGA/PGA reduced while the server still
+#             has the OLD, larger RAM/hugepages available), THEN the Server
+#             scales down (hugepages shrunk to match the new smaller SGA,
+#             then reboot onto the smaller RAM). Rationale: shrinking the
+#             server first would leave the running instance unable to hold
+#             its old, still-large SGA => instance won't come back up.
+#
+# The orchestrator role below is the single place that encodes this order.
+# ============================================================================
+
+workflow_steps:
+  scale_up:
+    - validate_input
+    - validate_memory
+    - validate_hugepages
+    - configure_hugepages      # conditional - only if not already optimal
+    - reboot_server            # conditional - only if hugepages changed
+    - startup_database_mount
+    - create_pfile_backup
+    - validate_db_configuration
+    - reconfigure_database
+    - shutdown_database
+    - update_dashboard
+
+  scale_down:
+    - validate_input
+    - validate_memory
+    - startup_database_mount
+    - create_pfile_backup
+    - validate_db_configuration
+    - reconfigure_database
+    - shutdown_database
+    - validate_hugepages
+    - configure_hugepages      # conditional - only if over-allocated vs new SGA
+    - reboot_server            # conditional - only if hugepages changed
+    - update_dashboard

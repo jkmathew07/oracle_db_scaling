@@ -1,0 +1,80 @@
+---
+- name: "ORA_WRK_STARTUP | check current instance status"
+  become: true
+  become_user: "{{ oracle_user }}"
+  environment:
+    ORACLE_HOME: "{{ oracle_home }}"
+    ORACLE_SID: "{{ oracle_sid }}"
+  ansible.builtin.shell: |
+    {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    set heading off feedback off pagesize 0
+    select status from v\$instance;
+    exit;
+    EOF
+  register: _owrk_startup_status_raw
+  changed_when: false
+  failed_when: false
+  tags: [worker, execute]
+
+- name: "ORA_WRK_STARTUP | normalize instance status"
+  ansible.builtin.set_fact:
+    instance_status: "{{ _owrk_startup_status_raw.stdout | default('') | trim | upper }}"
+  tags: [worker, execute]
+
+- name: "ORA_WRK_STARTUP | shutdown immediate if instance is OPEN"
+  become: true
+  become_user: "{{ oracle_user }}"
+  environment:
+    ORACLE_HOME: "{{ oracle_home }}"
+    ORACLE_SID: "{{ oracle_sid }}"
+  ansible.builtin.shell: |
+    {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    shutdown immediate;
+    exit;
+    EOF
+  register: _owrk_startup_shutdown
+  when: "'OPEN' in instance_status"
+  tags: [worker, execute]
+
+- name: "ORA_WRK_STARTUP | startup mount"
+  become: true
+  become_user: "{{ oracle_user }}"
+  environment:
+    ORACLE_HOME: "{{ oracle_home }}"
+    ORACLE_SID: "{{ oracle_sid }}"
+  ansible.builtin.shell: |
+    {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    startup mount;
+    exit;
+    EOF
+  register: _owrk_startup_result
+  when: instance_status == '' or 'OPEN' in instance_status
+  failed_when: "'ORA-' in _owrk_startup_result.stdout"
+  tags: [worker, execute]
+
+- name: "ORA_WRK_STARTUP | display startup action output"
+  ansible.builtin.debug:
+    msg: |
+      ╔═══════════════════════════════════════════════════════════════╗
+      ║  Oracle Scaling — Instance Startup (MOUNT) Output               ║
+      ╚═══════════════════════════════════════════════════════════════╝
+      Return code : {{ _owrk_startup_result.rc | default('n/a') }}
+      ────────────────────────────────────────────────────────────────
+      {{ _owrk_startup_result.stdout | default('(no action - see status below)') | truncate(2000) }}
+      {% if _owrk_startup_result.stderr | default('') | length > 0 %}
+      STDERR:
+      {{ _owrk_startup_result.stderr | truncate(500) }}
+      {% endif %}
+  tags: [worker, display]
+
+- name: "ORA_WRK_STARTUP | display instance status summary"
+  ansible.builtin.debug:
+    msg: |
+      ╔═══════════════════════════════════════════════════════════════╗
+      ║  Oracle Scaling — Instance Status Summary                      ║
+      ╚═══════════════════════════════════════════════════════════════╝
+      SID                    : {{ oracle_sid }}
+      Status Before Action   : {{ instance_status if instance_status | length > 0 else 'DOWN' }}
+      Action Taken           : {{ 'SHUTDOWN + STARTUP MOUNT' if 'OPEN' in instance_status else ('STARTUP MOUNT' if instance_status == '' else 'NONE — already MOUNTED') }}
+      Final Expected State   : MOUNT
+  tags: [worker, display]

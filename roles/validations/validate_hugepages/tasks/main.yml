@@ -1,0 +1,68 @@
+---
+- name: "ORA_VAL_HP | read current HugePages_Total from /proc/meminfo"
+  ansible.builtin.shell: "grep -i '^HugePages_Total' /proc/meminfo | awk '{print $2}'"
+  register: _ohp_total_raw
+  changed_when: false
+  tags: [validation, execute]
+
+- name: "ORA_VAL_HP | compute current hugepages allocation in GB"
+  ansible.builtin.set_fact:
+    current_hugepages_total: "{{ _ohp_total_raw.stdout | int }}"
+    current_hugepages_gb: "{{ ((_ohp_total_raw.stdout | int) * hugepage_size_mb / 1024) | round(2) }}"
+  tags: [validation, execute]
+
+- name: "ORA_VAL_HP | compute target hugepages band for requested SGA"
+  ansible.builtin.set_fact:
+    target_hugepages_gb_max: "{{ (sga_max_size_gb | float * (1 + hugepage_buffer_percent | float / 100)) | round(2) }}"
+    target_hugepages_gb_min: "{{ (sga_max_size_gb | float * (1 + hugepage_buffer_min_percent | float / 100)) | round(2) }}"
+  tags: [validation, execute]
+
+- name: "ORA_VAL_HP | scale_up — determine if reconfiguration is required"
+  ansible.builtin.set_fact:
+    optimal_huge_pages_configured: >-
+      {{ (current_hugepages_gb | float >= target_hugepages_gb_min | float) and
+         (current_hugepages_gb | float <= target_hugepages_gb_max | float) }}
+  when: scale_option == 'scale_up'
+  tags: [validation, execute]
+
+- name: "ORA_VAL_HP | scale_down — compute over-allocation vs new SGA target"
+  ansible.builtin.set_fact:
+    overallocation_percent: >-
+      {{ (((current_hugepages_gb | float - target_hugepages_gb_max | float) /
+          target_hugepages_gb_max | float) * 100) | round(2) }}
+  when: scale_option == 'scale_down'
+  tags: [validation, execute]
+
+- name: "ORA_VAL_HP | scale_down — determine if reconfiguration is required"
+  ansible.builtin.set_fact:
+    optimal_huge_pages_configured: "{{ overallocation_percent | float <= hugepage_overallocation_threshold_percent | float }}"
+  when: scale_option == 'scale_down'
+  tags: [validation, execute]
+
+- name: "ORA_VAL_HP | assert current hugepages can back requested SGA"
+  ansible.builtin.assert:
+    that:
+      - current_hugepages_gb | float >= sga_max_size_gb | float
+    fail_msg: >-
+      Invalid configuration: current hugepages ({{ current_hugepages_gb }} GB) cannot
+      back requested SGA_MAX_SIZE ({{ sga_max_size_gb }} GB + buffer)
+    quiet: true
+  register: _oval_hp_feasibility
+  when: scale_option == 'scale_down'
+  tags: [validation, execute]
+
+- name: "ORA_VAL_HP | display hugepages validation summary"
+  ansible.builtin.debug:
+    msg: |
+      ╔═══════════════════════════════════════════════════════════════╗
+      ║  Oracle Scaling — HugePages Validation Summary                 ║
+      ╚═══════════════════════════════════════════════════════════════╝
+      Current HugePages Total    : {{ current_hugepages_total }} ({{ current_hugepages_gb }} GB)
+      Target Band (GB)           : {{ target_hugepages_gb_min }} — {{ target_hugepages_gb_max }}
+      ────────────────────────────────────────────────────────────────
+      {% if scale_option == 'scale_down' %}
+      Over-allocation vs new SGA : {{ overallocation_percent }}% (threshold {{ hugepage_overallocation_threshold_percent }}%)
+      Feasibility Check          : {{ 'PASSED' if not _oval_hp_feasibility.failed else 'FAILED' }}
+      {% endif %}
+      Reconfiguration Required   : {{ 'NO — already optimal' if optimal_huge_pages_configured else 'YES' }}
+  tags: [validation, display]

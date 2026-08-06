@@ -1,0 +1,22 @@
+---
+# --- Oracle environment ---------------------------------------------------
+oracle_user: oracle
+oracle_group: oinstall
+oracle_home: /u01/app/oracle/product/19.0.0/dbhome_1
+oracle_sid: "{{ db_sid | mandatory }}"          # must be passed by Jenkins
+oracle_base: /u01/app/oracle
+
+# credentials (store in vault.yml, encrypted with ansible-vault, referenced here)
+oracle_sysdba_wallet: "{{ vault_oracle_sysdba_wallet | default(omit) }}"
+
+# --- Working paths ---------------------------------------------------------
+pfile_backup_dir: "{{ oracle_base }}/admin/{{ oracle_sid }}/pfile_backups"
+lock_dir: /tmp/oracle_scaling_locks
+log_dir: /var/log/oracle_scaling
+
+# --- Concurrency control ----------------------------------------------------
+lock_file: "{{ lock_dir }}/{{ oracle_sid }}.lock"
+lock_timeout_seconds: 5400   # fail the run if a stale lock older than this exists
+
+# --- Dashboard / reporting ---------------------------------------------------
+dashboard_endpoint: "{{ dashboard_url | default('') }}"   # optional REST endpoint

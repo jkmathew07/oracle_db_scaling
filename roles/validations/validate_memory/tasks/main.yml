@@ -1,0 +1,58 @@
+---
+- name: "ORA_VAL_MEM | compute memory budget"
+  ansible.builtin.set_fact:
+    max_oracle_mem_gb: "{{ (target_server_ram_gb | float * (max_oracle_mem_percent | float / 100)) | round(2) }}"
+    requested_oracle_mem_gb: "{{ (sga_max_size_gb | float + pga_aggregate_limit_gb | float) | round(2) }}"
+  tags: [validation, execute]
+
+- name: "ORA_VAL_MEM | assert requested memory within guardrail"
+  ansible.builtin.assert:
+    that:
+      - requested_oracle_mem_gb | float <= max_oracle_mem_gb | float
+    fail_msg: >-
+      Invalid memory configuration: requested SGA+PGA ({{ requested_oracle_mem_gb }} GB)
+      exceeds {{ max_oracle_mem_percent }}% of target RAM {{ target_server_ram_gb }} GB
+      (limit {{ max_oracle_mem_gb }} GB)
+    quiet: true
+  register: _oval_mem_budget
+  tags: [validation, execute]
+
+- name: "ORA_VAL_MEM | compute projected free memory for scale_down"
+  ansible.builtin.set_fact:
+    min_free_mem_gb: "{{ (target_server_ram_gb | float * (min_free_mem_percent_for_pga | float / 100)) | round(2) }}"
+    projected_free_mem_gb: "{{ (target_server_ram_gb | float - sga_max_size_gb | float) | round(2) }}"
+  when: scale_option == 'scale_down'
+  tags: [validation, execute]
+
+- name: "ORA_VAL_MEM | assert projected free memory sufficient for PGA/OS"
+  ansible.builtin.assert:
+    that:
+      - projected_free_mem_gb | float >= min_free_mem_gb | float
+    fail_msg: >-
+      Invalid configuration: projected free memory ({{ projected_free_mem_gb }} GB)
+      is below required minimum ({{ min_free_mem_gb }} GB) for PGA/OS on target RAM
+      {{ target_server_ram_gb }} GB
+    quiet: true
+  register: _oval_mem_freecheck
+  when: scale_option == 'scale_down'
+  tags: [validation, execute]
+
+- name: "ORA_VAL_MEM | display memory validation summary"
+  ansible.builtin.debug:
+    msg: |
+      ╔═══════════════════════════════════════════════════════════════╗
+      ║  Oracle Scaling — Memory Validation Summary                    ║
+      ╚═══════════════════════════════════════════════════════════════╝
+      Target Server RAM (GB)     : {{ target_server_ram_gb }}
+      Max Oracle Mem Allowed(GB) : {{ max_oracle_mem_gb }} ({{ max_oracle_mem_percent }}% cap)
+      Requested SGA+PGA (GB)     : {{ requested_oracle_mem_gb }}
+      Memory Budget Check        : {{ 'PASSED' if not _oval_mem_budget.failed else 'FAILED' }}
+      ────────────────────────────────────────────────────────────────
+      {% if scale_option == 'scale_down' %}
+      Min Free Mem Required (GB) : {{ min_free_mem_gb }} ({{ min_free_mem_percent_for_pga }}% floor)
+      Projected Free Mem (GB)    : {{ projected_free_mem_gb }}
+      Free Memory Check          : {{ 'PASSED' if not _oval_mem_freecheck.failed else 'FAILED' }}
+      {% else %}
+      Free Memory Check          : N/A (scale_up)
+      {% endif %}
+  tags: [validation, display]

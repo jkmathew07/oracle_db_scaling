@@ -1,0 +1,77 @@
+---
+- name: "ORA_VAL_DBCFG | query current instance parameters"
+  become: true
+  become_user: "{{ oracle_user }}"
+  environment:
+    ORACLE_HOME: "{{ oracle_home }}"
+    ORACLE_SID: "{{ oracle_sid }}"
+  ansible.builtin.shell: |
+    {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOF
+    set heading off feedback off pagesize 0 verify off
+    select name || ':' || value from v\$parameter
+    where name in ('cluster_database','sga_max_size','sga_target',
+    'pga_aggregate_target','pga_aggregate_limit','processes','sessions');
+    exit;
+    EOF
+  register: _odbcfg_current_raw
+  changed_when: false
+  tags: [validation, execute]
+
+- name: "ORA_VAL_DBCFG | display raw parameter query output"
+  ansible.builtin.debug:
+    msg: |
+      ╔═══════════════════════════════════════════════════════════════╗
+      ║  Oracle Scaling — Current Instance Parameters (raw)            ║
+      ╚═══════════════════════════════════════════════════════════════╝
+      Return code : {{ _odbcfg_current_raw.rc }}
+      ────────────────────────────────────────────────────────────────
+      {{ _odbcfg_current_raw.stdout | default('(no output)') | truncate(2000) }}
+      {% if _odbcfg_current_raw.stderr | default('') | length > 0 %}
+      STDERR:
+      {{ _odbcfg_current_raw.stderr | truncate(500) }}
+      {% endif %}
+  tags: [validation, display]
+
+- name: "ORA_VAL_DBCFG | parse current parameters into dict"
+  ansible.builtin.set_fact:
+    current_params: "{{ dict(_odbcfg_current_raw.stdout_lines | map('regex_replace', '^(.*):(.*)$', '\\1=\\2') | map('trim') | map('split', '=')) }}"
+  tags: [validation, execute]
+
+- name: "ORA_VAL_DBCFG | assert this is not a RAC instance"
+  ansible.builtin.assert:
+    that:
+      - current_params['CLUSTER_DATABASE'] | default('FALSE') | upper != 'TRUE'
+    fail_msg: "cluster_database=TRUE detected - this playbook does not support RAC. Aborting."
+    quiet: true
+  register: _odbcfg_rac_guard
+  tags: [validation, execute]
+
+- name: "ORA_VAL_DBCFG | compute desired-vs-current configuration delta"
+  ansible.builtin.set_fact:
+    db_config_already_optimal: >-
+      {{ (current_params['SGA_MAX_SIZE'] | int) == (sga_max_size_gb | int * 1073741824) and
+         (current_params['SGA_TARGET'] | int) == (sga_target_gb | int * 1073741824) and
+         (current_params['PGA_AGGREGATE_TARGET'] | int) == (pga_aggregate_target_gb | int * 1073741824) and
+         (current_params['PGA_AGGREGATE_LIMIT'] | int) == (pga_aggregate_limit_gb | int * 1073741824) and
+         (current_params['PROCESSES'] | int) == (processes | int) and
+         (current_params['SESSIONS'] | int) == (sessions | int) }}
+  tags: [validation, execute]
+
+- name: "ORA_VAL_DBCFG | display configuration comparison summary"
+  ansible.builtin.debug:
+    msg: |
+      ╔═══════════════════════════════════════════════════════════════╗
+      ║  Oracle Scaling — DB Configuration Comparison                  ║
+      ╚═══════════════════════════════════════════════════════════════╝
+      Parameter              Current (bytes/#)        Requested (GB/#)
+      ────────────────────────────────────────────────────────────────
+      SGA_MAX_SIZE         : {{ current_params['SGA_MAX_SIZE'] | default('n/a') }}   ->  {{ sga_max_size_gb }} G
+      SGA_TARGET           : {{ current_params['SGA_TARGET'] | default('n/a') }}   ->  {{ sga_target_gb }} G
+      PGA_AGGREGATE_TARGET : {{ current_params['PGA_AGGREGATE_TARGET'] | default('n/a') }}   ->  {{ pga_aggregate_target_gb }} G
+      PGA_AGGREGATE_LIMIT  : {{ current_params['PGA_AGGREGATE_LIMIT'] | default('n/a') }}   ->  {{ pga_aggregate_limit_gb }} G
+      PROCESSES            : {{ current_params['PROCESSES'] | default('n/a') }}   ->  {{ processes }}
+      SESSIONS             : {{ current_params['SESSIONS'] | default('n/a') }}   ->  {{ sessions }}
+      ────────────────────────────────────────────────────────────────
+      RAC Guard Check        : {{ 'PASSED' if not _odbcfg_rac_guard.failed else 'FAILED' }}
+      Configuration Status    : {{ 'ALREADY OPTIMAL — no changes required' if db_config_already_optimal else 'RECONFIGURATION REQUIRED' }}
+  tags: [validation, display]
